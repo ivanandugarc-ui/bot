@@ -1,0 +1,4115 @@
+/**
+ * GUARDIAN BOT - Types & Interfaces
+ */
+
+import {
+  ChatInputCommandInteraction,
+  SlashCommandBuilder,
+  SlashCommandSubcommandsOnlyBuilder,
+  PermissionResolvable,
+  AutocompleteInteraction,
+} from 'discord.js';
+import { GuardianClient } from './bot';
+
+// ================================
+// COMMAND INTERFACE
+// ================================
+
+export interface Command {
+  data: SlashCommandBuilder | SlashCommandSubcommandsOnlyBuilder | Omit<SlashCommandBuilder, 'addSubcommand' | 'addSubcommandGroup'>;
+  category: CommandCategory;
+  permissions?: PermissionResolvable[];
+  botPermissions?: PermissionResolvable[];
+  cooldown?: number; // segundos
+  guildOnly?: boolean;
+  premiumOnly?: boolean;
+  staffOnly?: boolean;
+  execute: (interaction: ChatInputCommandInteraction, client: GuardianClient) => Promise<void>;
+  autocomplete?: (interaction: AutocompleteInteraction, client: GuardianClient) => Promise<void>;
+}
+
+export type CommandCategory =
+  | 'moderation'
+  | 'tickets'
+  | 'automod'
+  | 'verification'
+  | 'reports'
+  | 'appeals'
+  | 'suggestions'
+  | 'backup'
+  | 'staff'
+  | 'config'
+  | 'utility';
+
+// ================================
+// EVENT INTERFACE
+// ================================
+
+export interface Event {
+  name: string;
+  once?: boolean;
+  execute: (...args: unknown[]) => Promise<void>;
+}
+
+// ================================
+// MODERATION TYPES
+// ================================
+
+export type ModerationAction =
+  | 'BAN'
+  | 'TEMPBAN'
+  | 'UNBAN'
+  | 'KICK'
+  | 'MUTE'
+  | 'TEMPMUTE'
+  | 'UNMUTE'
+  | 'TIMEOUT'
+  | 'UNTIMEOUT'
+  | 'WARN'
+  | 'NOTE';
+
+export interface ModerationOptions {
+  guildId: string;
+  targetId: string;
+  moderatorId: string;
+  action: ModerationAction;
+  reason: string;
+  duration?: number; // segundos
+  evidence?: string[];
+  metadata?: Record<string, unknown>;
+  silent?: boolean;
+}
+
+export interface ModerationResult {
+  success: boolean;
+  caseId?: string;
+  caseNumber?: number;
+  error?: string;
+}
+
+// ================================
+// AUTOMOD TYPES
+// ================================
+
+export interface AutomodViolation {
+  type: AutomodViolationType;
+  severity: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
+  action: AutomodActionType;
+  reason: string;
+  content?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export type AutomodViolationType =
+  | 'SPAM'
+  | 'FLOOD'
+  | 'SCAM'
+  | 'PHISHING'
+  | 'INVITE'
+  | 'ADVERTISING'
+  | 'MASS_MENTIONS'
+  | 'TOXICITY'
+  | 'HARASSMENT'
+  | 'BAD_WORDS'
+  | 'SUSPICIOUS_LINK'
+  | 'DUPLICATE';
+
+export type AutomodActionType = 'WARN' | 'TIMEOUT' | 'KICK' | 'BAN' | 'DELETE';
+
+// ================================
+// TICKET TYPES
+// ================================
+
+export interface TicketCreateOptions {
+  guildId: string;
+  userId: string;
+  category: string;
+  subject?: string;
+  initialMessage?: string;
+}
+
+// ================================
+// EMBED COLORS
+// ================================
+
+export const Colors = {
+  PRIMARY: 0x5865F2,    // Discord Blurple
+  SUCCESS: 0x57F287,    // Verde
+  WARNING: 0xFEE75C,    // Amarillo
+  ERROR: 0xED4245,      // Rojo
+  INFO: 0x5DADE2,       // Azul claro
+  MUTED: 0x99AAB5,      // Gris
+  MOD: 0xFF6B35,        // Naranja moderación
+  STAFF: 0xA855F7,      // Morado staff
+  TICKET: 0x06B6D4,     // Cian tickets
+  LOG: 0x2C3E50,        // Oscuro logs
+} as const;
+
+// ================================
+// DURATION PARSING
+// ================================
+
+export interface ParsedDuration {
+  seconds: number;
+  formatted: string;
+}
+
+/**
+ * GUARDIAN BOT - Bot Client
+ * Instancia principal del cliente Discord
+ */
+
+import 'dotenv/config';
+import { Client, GatewayIntentBits, Partials, Collection } from 'discord.js';
+import { logger } from './utils/logger';
+import { prisma } from './database/client';
+import { redis } from './database/redis';
+import { loadCommands } from './handlers/commandHandler';
+import { loadEvents } from './handlers/eventHandler';
+import { initAutomod } from './automod';
+import { initAntiRaid } from './antiraid';
+import type { Command } from './types';
+
+// ================================
+// EXTENDED CLIENT
+// ================================
+
+export class GuardianClient extends Client {
+  commands: Collection<string, Command> = new Collection();
+  cooldowns: Collection<string, Collection<string, number>> = new Collection();
+  uptime_start: number = Date.now();
+
+  constructor() {
+    super({
+      intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMembers,
+        GatewayIntentBits.GuildModeration,
+        GatewayIntentBits.GuildEmojisAndStickers,
+        GatewayIntentBits.GuildIntegrations,
+        GatewayIntentBits.GuildWebhooks,
+        GatewayIntentBits.GuildInvites,
+        GatewayIntentBits.GuildPresences,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.GuildMessageReactions,
+        GatewayIntentBits.GuildMessageTyping,
+        GatewayIntentBits.MessageContent,
+        GatewayIntentBits.DirectMessages,
+      ],
+      partials: [
+        Partials.Message,
+        Partials.Channel,
+        Partials.Reaction,
+        Partials.GuildMember,
+        Partials.User,
+      ],
+      allowedMentions: {
+        parse: ['users', 'roles'],
+        repliedUser: true,
+      },
+    });
+  }
+
+  async start(): Promise<void> {
+    logger.info('[Bot] Iniciando Guardian Bot...');
+
+    try {
+      // 1. Conectar base de datos
+      await prisma.$connect();
+      logger.info('[Bot] PostgreSQL conectado');
+
+      // 2. Conectar Redis
+      await redis.ping();
+      logger.info('[Bot] Redis conectado');
+
+      // 3. Cargar comandos
+      await loadCommands(this);
+      logger.info(`[Bot] ${this.commands.size} comandos cargados`);
+
+      // 4. Cargar eventos
+      await loadEvents(this);
+      logger.info('[Bot] Eventos registrados');
+
+      // 5. Inicializar módulos
+      await initAutomod(this);
+      await initAntiRaid(this);
+      logger.info('[Bot] Módulos de seguridad inicializados');
+
+      // 6. Login en Discord
+      await this.login(process.env['DISCORD_TOKEN']);
+
+    } catch (error) {
+      logger.error('[Bot] Error en la inicialización:', error);
+      await this.shutdown();
+      process.exit(1);
+    }
+  }
+
+  async shutdown(): Promise<void> {
+    logger.info('[Bot] Apagando...');
+    try {
+      await prisma.$disconnect();
+      redis.disconnect();
+      this.destroy();
+      logger.info('[Bot] Apagado correctamente');
+    } catch (error) {
+      logger.error('[Bot] Error al apagar:', error);
+    }
+  }
+}
+
+// Instancia y arranque
+const client = new GuardianClient();
+
+client.start().catch((error) => {
+  logger.error('[Bot] Error fatal:', error);
+  process.exit(1);
+});
+
+// Manejo de señales de apagado
+process.on('SIGTERM', () => client.shutdown());
+process.on('SIGINT', () => client.shutdown());
+
+/**
+ * GUARDIAN BOT - Entry Point
+ * Bot de Discord Premium para moderación y administración
+ */
+
+import 'dotenv/config';
+import { ShardingManager } from 'discord.js';
+import path from 'path';
+import { logger } from './utils/logger';
+import { validateEnv } from './config/env';
+
+// Validar variables de entorno antes de iniciar
+validateEnv();
+
+const shardFile = path.join(__dirname, 'bot.js');
+
+const manager = new ShardingManager(shardFile, {
+  token: process.env['DISCORD_TOKEN'],
+  totalShards: process.env['BOT_SHARDS'] === 'auto' ? 'auto' : parseInt(process.env['BOT_SHARDS'] ?? '1'),
+  shardArgs: [],
+  execArgv: [],
+});
+
+manager.on('shardCreate', (shard) => {
+  logger.info(`[Sharding] Shard #${shard.id} lanzado`);
+
+  shard.on('ready', () => {
+    logger.info(`[Sharding] Shard #${shard.id} listo`);
+  });
+
+  shard.on('disconnect', () => {
+    logger.warn(`[Sharding] Shard #${shard.id} desconectado`);
+  });
+
+  shard.on('reconnecting', () => {
+    logger.info(`[Sharding] Shard #${shard.id} reconectando...`);
+  });
+
+  shard.on('error', (error) => {
+    logger.error(`[Sharding] Error en Shard #${shard.id}:`, error);
+  });
+});
+
+manager.spawn().then(() => {
+  logger.info('[Guardian Bot] Todos los shards iniciados correctamente');
+}).catch((error) => {
+  logger.error('[Guardian Bot] Error al iniciar shards:', error);
+  process.exit(1);
+});
+
+// Manejo de errores no capturados
+process.on('uncaughtException', (error) => {
+  logger.error('[Proceso] Error no capturado:', error);
+});
+
+process.on('unhandledRejection', (reason) => {
+  logger.error('[Proceso] Promesa rechazada no manejada:', reason);
+});
+
+// ================================
+// GUARDIAN BOT - PRISMA SCHEMA
+// ================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ================================
+// GUILD (SERVIDOR)
+// ================================
+
+model Guild {
+  id        String   @id // Discord Guild ID
+  name      String
+  iconUrl   String?
+  ownerId   String
+  joinedAt  DateTime @default(now())
+  premium   Boolean  @default(false)
+  premiumUntil DateTime?
+
+  // Relaciones
+  config          GuildConfig?
+  moderations     Moderation[]
+  cases           ModerationCase[]
+  tickets         Ticket[]
+  ticketConfig    TicketConfig?
+  automodConfig   AutomodConfig?
+  antiRaidConfig  AntiRaidConfig?
+  verificationConfig VerificationConfig?
+  logConfig       LogConfig?
+  welcomeConfig   WelcomeConfig?
+  reactionRoles   ReactionRole[]
+  suggestions     Suggestion[]
+  reports         Report[]
+  appeals         Appeal[]
+  backups         Backup[]
+  staffStats      StaffStats[]
+  warnings        Warning[]
+  aiConfig        AiConfig?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("guilds")
+}
+
+// ================================
+// GUILD CONFIG GENERAL
+// ================================
+
+model GuildConfig {
+  id              String  @id @default(cuid())
+  guildId         String  @unique
+  guild           Guild   @relation(fields: [guildId], references: [id], onDelete: Cascade)
+
+  prefix          String  @default("!")
+  language        String  @default("es")
+  modRoleIds      String[] // IDs de roles de moderación
+  adminRoleIds    String[] // IDs de roles de admin
+  mutedRoleId     String?
+  staffChannelId  String?
+  appealChannelId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("guild_configs")
+}
+
+// ================================
+// USUARIOS
+// ================================
+
+model User {
+  id            String   @id // Discord User ID
+  username      String
+  discriminator String   @default("0")
+  avatarUrl     String?
+  bot           Boolean  @default(false)
+  premium       Boolean  @default(false)
+
+  moderationsAsTarget Moderation[] @relation("TargetUser")
+  moderationsAsMod    Moderation[] @relation("ModeratorUser")
+  casesAsTarget       ModerationCase[] @relation("CaseTarget")
+  casesAsMod          ModerationCase[] @relation("CaseModerator")
+  tickets             Ticket[]
+  reports             Report[]  @relation("Reporter")
+  reportedIn          Report[]  @relation("Reported")
+  appeals             Appeal[]
+  staffStats          StaffStats[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("users")
+}
+
+// ================================
+// MODERACIÓN
+// ================================
+
+enum ModerationType {
+  BAN
+  TEMPBAN
+  UNBAN
+  KICK
+  MUTE
+  TEMPMUTE
+  UNMUTE
+  TIMEOUT
+  UNTIMEOUT
+  WARN
+  REMOVEWARN
+  CLEAR
+  NUKE
+  LOCK
+  UNLOCK
+  SLOWMODE
+  NICKNAME
+  ROLE_ADD
+  ROLE_REMOVE
+  NOTE
+}
+
+enum ModerationStatus {
+  ACTIVE
+  EXPIRED
+  REVOKED
+  APPEALED
+}
+
+model Moderation {
+  id          String   @id @default(cuid())
+  guildId     String
+  guild       Guild    @relation(fields: [guildId], references: [id], onDelete: Cascade)
+
+  targetId    String
+  target      User     @relation("TargetUser", fields: [targetId], references: [id])
+  moderatorId String
+  moderator   User     @relation("ModeratorUser", fields: [moderatorId], references: [id])
+
+  type        ModerationType
+  reason      String
+  duration    Int?     // en segundos
+  expiresAt   DateTime?
+  status      ModerationStatus @default(ACTIVE)
+
+  evidence    String[] // URLs de evidencia
+  metadata    Json?    // datos adicionales
+
+  case        ModerationCase?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([guildId, targetId])
+  @@index([guildId, status])
+  @@map("moderations")
+}
+
+// ================================
+// CASOS
+// ================================
+
+model ModerationCase {
+  id            String   @id @default(cuid())
+  caseNumber    Int      // número secuencial por guild
+  guildId       String
+  guild         Guild    @relation(fields: [guildId], references: [id], onDelete: Cascade)
+
+  moderationId  String   @unique
+  moderation    Moderation @relation(fields: [moderationId], references: [id])
+
+  targetId      String
+  target        User     @relation("CaseTarget", fields: [targetId], references: [id])
+  moderatorId   String
+  moderator     User     @relation("CaseModerator", fields: [moderatorId], references: [id])
+
+  type          ModerationType
+  reason        String
+  editedReason  String?
+  editedBy      String?
+  editedAt      DateTime?
+
+  notes         String?
+  evidence      String[]
+  messageId     String?  // ID del mensaje del log
+
+  appeal        Appeal?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([guildId, caseNumber])
+  @@index([guildId, targetId])
+  @@map("moderation_cases")
+}
+
+// ================================
+// ADVERTENCIAS
+// ================================
+
+model Warning {
+  id          String   @id @default(cuid())
+  guildId     String
+  guild       Guild    @relation(fields: [guildId], references: [id], onDelete: Cascade)
+  userId      String
+  moderatorId String
+  reason      String
+  active      Boolean  @default(true)
+  points      Int      @default(1)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([guildId, userId])
+  @@map("warnings")
+}
+
+// ================================
+// TICKETS
+// ================================
+
+enum TicketStatus {
+  OPEN
+  CLAIMED
+  CLOSED
+  ARCHIVED
+}
+
+enum TicketCategory {
+  SUPPORT
+  REPORT
+  APPEAL
+  STAFF
+  TECHNICAL
+  CUSTOM
+}
+
+model Ticket {
+  id          String   @id @default(cuid())
+  ticketNumber Int     // número secuencial por guild
+  guildId     String
+  guild       Guild    @relation(fields: [guildId], references: [id], onDelete: Cascade)
+
+  channelId   String   @unique
+  userId      String
+  user        User     @relation(fields: [userId], references: [id])
+
+  category    TicketCategory
+  subject     String?
+  status      TicketStatus @default(OPEN)
+
+  claimedBy   String?  // moderator ID
+  claimedAt   DateTime?
+
+  closedBy    String?
+  closedAt    DateTime?
+  closeReason String?
+
+  participants String[] // adicionales user IDs
+  tags        String[]
+
+  messages    TicketMessage[]
+  transcript  TicketTranscript?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([guildId, ticketNumber])
+  @@index([guildId, status])
+  @@map("tickets")
+}
+
+model TicketMessage {
+  id        String   @id @default(cuid())
+  ticketId  String
+  ticket    Ticket   @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  authorId  String
+  content   String
+  attachments String[]
+  isStaff   Boolean  @default(false)
+
+  createdAt DateTime @default(now())
+
+  @@index([ticketId])
+  @@map("ticket_messages")
+}
+
+model TicketTranscript {
+  id        String   @id @default(cuid())
+  ticketId  String   @unique
+  ticket    Ticket   @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  htmlContent String?
+  txtContent  String?
+  url         String?
+
+  createdAt DateTime @default(now())
+
+  @@map("ticket_transcripts")
+}
+
+model TicketConfig {
+  id              String  @id @default(cuid())
+  guildId         String  @unique
+  guild           Guild   @relation(fields: [guildId], references: [id], onDelete: Cascade)
+
+  enabled         Boolean @default(true)
+  panelChannelId  String?
+  categoryId      String?
+  staffRoleIds    String[]
+  logChannelId    String?
+  maxTickets      Int     @default(3)
+  transcriptChannelId String?
+
+  categories      Json    @default("[]") // categorías personalizadas
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("ticket_configs")
+}
+
+// ================================
+// AUTOMOD
+// ================================
+
+model AutomodConfig {
+  id      String @id @default(cuid())
+  guildId String @unique
+  guild   Guild  @relation(fields: [guildId], references: [id], onDelete: Cascade)
+
+  enabled Boolean @default(false)
+
+  // Módulos
+  antiSpam          Boolean @default(true)
+  antiFlood         Boolean @default(true)
+  antiScam          Boolean @default(true)
+  antiPhishing      Boolean @default(true)
+  antiInvites       Boolean @default(true)
+  antiAdvertising   Boolean @default(true)
+  antiMassMentions  Boolean @default(true)
+  antiToxicity      Boolean @default(false) // Requiere IA
+  antiRepeat        Boolean @default(true)
+  badWords          Boolean @default(false)
+  suspiciousLinks   Boolean @default(true)
+
+  // Configuración
+  spamThreshold     Int     @default(5)  // mensajes por 5 segundos
+  floodThreshold    Int     @default(10) // caracteres por mensaje
+  mentionThreshold  Int     @default(10) // menciones por mensaje
+  duplicateThreshold Int    @default(3)  // mensajes repetidos
+
+  // Palabras personalizadas
+  bannedWords       String[]
+  allowedDomains    String[]
+  whitelistChannels String[]
+  whitelistRoles    String[]
+
+  // Sanciones
+  spamAction        String  @default("MUTE") // WARN, TIMEOUT, KICK, BAN
+  scamAction        String  @default("BAN")
+  phishingAction    String  @default("BAN")
+  toxicityAction    String  @default("WARN")
+  inviteAction      String  @default("WARN")
+
+  // Duración de timeout/mute en segundos
+  defaultTimeout    Int     @default(300)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("automod_configs")
+}
+
+// ================================
+// ANTIRAID
+// ================================
+
+model AntiRaidConfig {
+  id      String @id @default(cuid())
+  guildId String @unique
+  guild   Guild  @relation(fields: [guildId], references: [id], onDelete: Cascade)
+
+  enabled             Boolean @default(false)
+  lockdownActive      Boolean @default(false)
+  lockdownAt          DateTime?
+
+  // Umbrales
+  joinThreshold       Int     @default(10) // joins en X segundos
+  joinThresholdTime   Int     @default(10) // segundos
+  channelCreateThreshold Int  @default(5)
+  roleCreateThreshold Int     @default(5)
+  deleteThreshold     Int     @default(10)
+
+  // Acciones
+  autoLockdown        Boolean @default(true)
+  autoKickSuspected   Boolean @default(false)
+  requireVerification Boolean @default(true)
+  blockInvites        Boolean @default(true)
+
+  // Alertas
+  alertChannelId      String?
+  alertRoleId         String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("antiraid_configs")
+}
+
+// ================================
+// VERIFICACIÓN
+// ================================
+
+enum VerificationMethod {
+  BUTTON
+  MATH_CAPTCHA
+  VISUAL_CAPTCHA
+  CUSTOM
+}
+
+model VerificationConfig {
+  id      String @id @default(cuid())
+  guildId String @unique
+  guild   Guild  @relation(fields: [guildId], references: [id], onDelete: Cascade)
+
+  enabled           Boolean @default(false)
+  method            VerificationMethod @default(BUTTON)
+  channelId         String?
+  verifiedRoleId    String?
+  unverifiedRoleId  String?
+  kickAfterMinutes  Int?    // null = no kick
+  logChannelId      String?
+  welcomeMessage    String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("verification_configs")
+}
+
+// ================================
+// LOGS
+// ================================
+
+model LogConfig {
+  id      String @id @default(cuid())
+  guildId String @unique
+  guild   Guild  @relation(fields: [guildId], references: [id], onDelete: Cascade)
+
+  enabled     Boolean @default(false)
+
+  // Canales de log por categoría
+  moderationChannel String?
+  messageChannel    String?
+  memberChannel     String?
+  channelChannel    String?
+  roleChannel       String?
+  serverChannel     String?
+  ticketChannel     String?
+
+  // Qué registrar
+  logBans           Boolean @default(true)
+  logKicks          Boolean @default(true)
+  logMutes          Boolean @default(true)
+  logTimeouts       Boolean @default(true)
+  logWarns          Boolean @default(true)
+  logMessageDelete  Boolean @default(true)
+  logMessageEdit    Boolean @default(true)
+  logMemberJoin     Boolean @default(true)
+  logMemberLeave    Boolean @default(true)
+  logNicknameChange Boolean @default(true)
+  logRoleChange     Boolean @default(true)
+  logChannelCreate  Boolean @default(true)
+  logChannelDelete  Boolean @default(true)
+  logInviteCreate   Boolean @default(true)
+  logTickets        Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("log_configs")
+}
+
+// ================================
+// BIENVENIDA
+// ================================
+
+model WelcomeConfig {
+  id      String @id @default(cuid())
+  guildId String @unique
+  guild   Guild  @relation(fields: [guildId], references: [id], onDelete: Cascade)
+
+  enabled         Boolean @default(false)
+  channelId       String?
+  message         String?
+  embedEnabled    Boolean @default(true)
+  embedColor      String  @default("#5865F2")
+  embedImage      String?
+  dmEnabled       Boolean @default(false)
+  dmMessage       String?
+  autoRoleId      String?
+  backgroundUrl   String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("welcome_configs")
+}
+
+// ================================
+// REACTION ROLES
+// ================================
+
+model ReactionRole {
+  id        String   @id @default(cuid())
+  guildId   String
+  guild     Guild    @relation(fields: [guildId], references: [id], onDelete: Cascade)
+
+  channelId String
+  messageId String
+  name      String
+  type      String   @default("BUTTON") // BUTTON, SELECT, REACTION
+
+  items     ReactionRoleItem[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("reaction_roles")
+}
+
+model ReactionRoleItem {
+  id             String       @id @default(cuid())
+  reactionRoleId String
+  reactionRole   ReactionRole @relation(fields: [reactionRoleId], references: [id], onDelete: Cascade)
+
+  roleId         String
+  emoji          String?
+  label          String
+  description    String?
+  temporary      Boolean @default(false) // rol temporal
+  duration       Int?    // en minutos si es temporal
+
+  @@map("reaction_role_items")
+}
+
+// ================================
+// SUGERENCIAS
+// ================================
+
+enum SuggestionStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  IMPLEMENTED
+}
+
+model Suggestion {
+  id        String   @id @default(cuid())
+  guildId   String
+  guild     Guild    @relation(fields: [guildId], references: [id], onDelete: Cascade)
+
+  userId    String
+  content   String
+  status    SuggestionStatus @default(PENDING)
+
+  upvotes   Int     @default(0)
+  downvotes Int     @default(0)
+  voters    Json    @default("{}") // {userId: "up" | "down"}
+
+  staffComment   String?
+  staffId        String?
+  reviewedAt     DateTime?
+
+  messageId  String?
+  channelId  String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([guildId])
+  @@map("suggestions")
+}
+
+// ================================
+// REPORTES
+// ================================
+
+enum ReportStatus {
+  PENDING
+  REVIEWING
+  RESOLVED
+  DISMISSED
+}
+
+model Report {
+  id        String   @id @default(cuid())
+  guildId   String
+  guild     Guild    @relation(fields: [guildId], references: [id], onDelete: Cascade)
+
+  reporterId String
+  reporter   User    @relation("Reporter", fields: [reporterId], references: [id])
+  reportedId String
+  reported   User    @relation("Reported", fields: [reportedId], references: [id])
+
+  reason    String
+  evidence  String[]
+  status    ReportStatus @default(PENDING)
+
+  assignedTo String?
+  resolution String?
+  resolvedAt DateTime?
+
+  messageId  String?
+  channelId  String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([guildId, status])
+  @@map("reports")
+}
+
+// ================================
+// APELACIONES
+// ================================
+
+enum AppealStatus {
+  PENDING
+  REVIEWING
+  APPROVED
+  REJECTED
+}
+
+model Appeal {
+  id        String   @id @default(cuid())
+  guildId   String
+  guild     Guild    @relation(fields: [guildId], references: [id], onDelete: Cascade)
+
+  userId    String
+  user      User    @relation(fields: [userId], references: [id])
+  caseId    String?
+  case      ModerationCase? @relation(fields: [caseId], references: [id])
+
+  type      String  // BAN, MUTE, TIMEOUT
+  reason    String  // razón de la apelación
+  status    AppealStatus @default(PENDING)
+
+  reviewedBy String?
+  reviewNote String?
+  reviewedAt DateTime?
+
+  ticketId   String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([guildId, status])
+  @@map("appeals")
+}
+
+// ================================
+// BACKUPS
+// ================================
+
+model Backup {
+  id        String   @id @default(cuid())
+  guildId   String
+  guild     Guild    @relation(fields: [guildId], references: [id], onDelete: Cascade)
+
+  name      String
+  size      Int      @default(0) // bytes
+  data      Json     // datos del backup
+  createdBy String
+
+  createdAt DateTime @default(now())
+
+  @@index([guildId])
+  @@map("backups")
+}
+
+// ================================
+// ESTADÍSTICAS DE STAFF
+// ================================
+
+model StaffStats {
+  id        String   @id @default(cuid())
+  guildId   String
+  guild     Guild    @relation(fields: [guildId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+
+  ticketsClosed   Int @default(0)
+  warnsIssued     Int @default(0)
+  bansDone        Int @default(0)
+  kicksDone       Int @default(0)
+  mutesDone       Int @default(0)
+  casesManagedCount Int @default(0)
+  totalActiveTime Int @default(0) // en minutos
+
+  periodStart   DateTime
+  periodEnd     DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([guildId, userId, periodStart])
+  @@index([guildId])
+  @@map("staff_stats")
+}
+
+// ================================
+// IA CONFIG
+// ================================
+
+model AiConfig {
+  id      String @id @default(cuid())
+  guildId String @unique
+  guild   Guild  @relation(fields: [guildId], references: [id], onDelete: Cascade)
+
+  enabled           Boolean @default(false)
+  provider          String  @default("openai") // openai, anthropic
+  model             String  @default("gpt-4o-mini")
+
+  detectToxicity    Boolean @default(true)
+  detectThreats     Boolean @default(true)
+  detectHarassment  Boolean @default(true)
+  detectScams       Boolean @default(true)
+  detectPhishing    Boolean @default(true)
+
+  toxicityThreshold Float   @default(0.7) // 0.0 - 1.0
+  action            String  @default("WARN")
+
+  // Canales exentos
+  exemptChannels    String[]
+  exemptRoles       String[]
+
+  totalRequests     Int     @default(0)
+  totalTokens       Int     @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("ai_configs")
+}
+
+// ================================
+// AUDIT LOG
+// ================================
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  guildId   String
+  userId    String?
+  action    String
+  target    String?
+  metadata  Json?
+  ip        String?
+
+  createdAt DateTime @default(now())
+
+  @@index([guildId, action])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "commonjs",
+    "lib": ["ES2022"],
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "removeComments": false,
+    "noImplicitAny": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+    "paths": {
+      "@/*": ["./src/*"],
+      "@commands/*": ["./src/commands/*"],
+      "@events/*": ["./src/events/*"],
+      "@handlers/*": ["./src/handlers/*"],
+      "@database/*": ["./src/database/*"],
+      "@services/*": ["./src/services/*"],
+      "@utils/*": ["./src/utils/*"],
+      "@config/*": ["./src/config/*"],
+      "@middlewares/*": ["./src/middlewares/*"]
+    }
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist", "dashboard"]
+}
+
+{
+  "name": "discord-guardian-bot",
+  "version": "2.0.0",
+  "description": "Bot de Discord premium para moderación, seguridad y gestión de comunidades",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
+    "lint": "eslint src --ext .ts",
+    "lint:fix": "eslint src --ext .ts --fix",
+    "format": "prettier --write \"src/**/*.ts\"",
+    "db:generate": "prisma generate",
+    "db:migrate": "prisma migrate dev",
+    "db:migrate:prod": "prisma migrate deploy",
+    "db:studio": "prisma studio",
+    "db:seed": "ts-node prisma/seed.ts",
+    "deploy:commands": "ts-node src/handlers/deployCommands.ts",
+    "docker:build": "docker-compose build",
+    "docker:up": "docker-compose up -d",
+    "docker:down": "docker-compose down",
+    "docker:logs": "docker-compose logs -f bot"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.14.0",
+    "discord.js": "^14.15.3",
+    "openai": "^4.52.7",
+    "ioredis": "^5.4.1",
+    "winston": "^3.13.0",
+    "winston-daily-rotate-file": "^5.0.0",
+    "dotenv": "^16.4.5",
+    "zod": "^3.23.8",
+    "node-cron": "^3.0.3",
+    "sharp": "^0.33.4",
+    "canvas": "^2.11.2",
+    "html-pdf-node": "^1.0.8",
+    "rate-limiter-flexible": "^5.0.3",
+    "express": "^4.19.2",
+    "helmet": "^7.1.0",
+    "cors": "^2.8.5",
+    "jsonwebtoken": "^9.0.2",
+    "bcryptjs": "^2.4.3",
+    "uuid": "^10.0.0",
+    "date-fns": "^3.6.0",
+    "ms": "^2.1.3",
+    "axios": "^1.7.2",
+    "cheerio": "^1.0.0",
+    "bad-words": "^3.0.4",
+    "compromise": "^14.14.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.9",
+    "@types/express": "^4.17.21",
+    "@types/jsonwebtoken": "^9.0.6",
+    "@types/bcryptjs": "^2.4.6",
+    "@types/uuid": "^10.0.0",
+    "@types/ms": "^0.7.34",
+    "@types/cors": "^2.8.17",
+    "@typescript-eslint/eslint-plugin": "^7.15.0",
+    "@typescript-eslint/parser": "^7.15.0",
+    "eslint": "^8.57.0",
+    "prettier": "^3.3.2",
+    "prisma": "^5.14.0",
+    "ts-node": "^10.9.2",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.5.3"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
+
+/**
+ * GUARDIAN BOT - AntiRaid System
+ * Sistema de protección contra raids masivos
+ */
+
+import {
+  Guild,
+  GuildMember,
+  GuildChannel,
+  Role,
+  EmbedBuilder,
+  TextChannel,
+  PermissionFlagsBits,
+  ChannelType,
+  AuditLogEvent,
+  time,
+  TimestampStyles,
+  userMention,
+} from 'discord.js';
+import { prisma } from '../database/client';
+import { redis, cacheWithFallback, CacheKeys, incrementCounter } from '../database/redis';
+import { ModerationService } from '../services/moderationService';
+import { Colors } from '../types';
+import { logger } from '../utils/logger';
+import type { GuardianClient } from '../bot';
+
+interface RaidEntry {
+  userId: string;
+  timestamp: number;
+}
+
+export class AntiRaidSystem {
+  private joinQueue: Map<string, RaidEntry[]> = new Map();
+
+  // ================================
+  // DETECTAR RAID POR JOINS
+  // ================================
+
+  async onMemberJoin(guild: Guild, member: GuildMember): Promise<void> {
+    const config = await this.getConfig(guild.id);
+    if (!config?.enabled) return;
+
+    const guildId = guild.id;
+    const now = Date.now();
+    const windowMs = (config.joinThresholdTime ?? 10) * 1000;
+    const threshold = config.joinThreshold ?? 10;
+
+    // Mantener queue de joins recientes
+    if (!this.joinQueue.has(guildId)) this.joinQueue.set(guildId, []);
+    const queue = this.joinQueue.get(guildId)!;
+
+    // Filtrar entradas fuera de la ventana de tiempo
+    const recent = queue.filter((e) => now - e.timestamp < windowMs);
+    recent.push({ userId: member.id, timestamp: now });
+    this.joinQueue.set(guildId, recent);
+
+    // Usar también Redis para persistencia cross-shard
+    const raidKey = CacheKeys.raidDetection(guildId);
+    const raidCount = await incrementCounter(raidKey, config.joinThresholdTime ?? 10);
+
+    if (raidCount >= threshold) {
+      logger.warn(`[AntiRaid] Raid detectado en ${guild.name}: ${raidCount} joins en ${config.joinThresholdTime}s`);
+      await this.activateLockdown(guild, config, recent.map((e) => e.userId));
+    }
+  }
+
+  // ================================
+  // DETECTAR ACCIONES MASIVAS
+  // ================================
+
+  async onChannelCreate(guild: Guild, _channel: GuildChannel): Promise<void> {
+    const config = await this.getConfig(guild.id);
+    if (!config?.enabled) return;
+
+    const count = await incrementCounter(`antiraid_ch_create:${guild.id}`, 60);
+    if (count >= (config.channelCreateThreshold ?? 5)) {
+      await this.activateLockdown(guild, config, [], 'Creación masiva de canales detectada');
+    }
+  }
+
+  async onChannelDelete(guild: Guild, _channel: GuildChannel): Promise<void> {
+    const config = await this.getConfig(guild.id);
+    if (!config?.enabled) return;
+
+    const count = await incrementCounter(`antiraid_ch_delete:${guild.id}`, 60);
+    if (count >= (config.deleteThreshold ?? 10)) {
+      await this.activateLockdown(guild, config, [], 'Eliminación masiva de canales detectada');
+    }
+  }
+
+  async onRoleCreate(guild: Guild, _role: Role): Promise<void> {
+    const config = await this.getConfig(guild.id);
+    if (!config?.enabled) return;
+
+    const count = await incrementCounter(`antiraid_role_create:${guild.id}`, 60);
+    if (count >= (config.roleCreateThreshold ?? 5)) {
+      await this.activateLockdown(guild, config, [], 'Creación masiva de roles detectada');
+    }
+  }
+
+  // ================================
+  // ACTIVAR LOCKDOWN
+  // ================================
+
+  async activateLockdown(
+    guild: Guild,
+    config: NonNullable<Awaited<ReturnType<AntiRaidSystem['getConfig']>>>,
+    suspectedUserIds: string[] = [],
+    reason: string = 'Raid detectado'
+  ): Promise<void> {
+    if (config.lockdownActive) return; // Ya está en lockdown
+
+    logger.warn(`[AntiRaid] Iniciando lockdown en ${guild.name}: ${reason}`);
+
+    // Actualizar BD
+    await prisma.antiRaidConfig.update({
+      where: { guildId: guild.id },
+      data: { lockdownActive: true, lockdownAt: new Date() },
+    });
+
+    const actions: Promise<unknown>[] = [];
+
+    // 1. Bloquear canales de texto
+    if (config.autoLockdown) {
+      const textChannels = guild.channels.cache.filter(
+        (c) => c.type === ChannelType.GuildText && c.permissionsFor(guild.roles.everyone)?.has(PermissionFlagsBits.SendMessages)
+      );
+
+      for (const [, channel] of textChannels.entries()) {
+        actions.push(
+          (channel as TextChannel).permissionOverwrites
+            .edit(guild.roles.everyone, { SendMessages: false })
+            .catch(() => null)
+        );
+      }
+    }
+
+    await Promise.all(actions);
+
+    // 2. Kickear usuarios sospechosos
+    if (config.autoKickSuspected && suspectedUserIds.length > 0) {
+      for (const userId of suspectedUserIds) {
+        const member = guild.members.cache.get(userId);
+        if (member?.kickable) {
+          await member.kick(`[AntiRaid] Expulsado durante lockdown: ${reason}`).catch(() => null);
+        }
+      }
+    }
+
+    // 3. Notificar al canal de alertas
+    if (config.alertChannelId) {
+      const alertChannel = guild.channels.cache.get(config.alertChannelId) as TextChannel;
+      if (alertChannel) {
+        const embed = new EmbedBuilder()
+          .setColor(Colors.ERROR)
+          .setTitle('🚨 LOCKDOWN ACTIVADO')
+          .setDescription(`**Razón:** ${reason}`)
+          .addFields(
+            { name: '📊 Usuarios sospechosos', value: suspectedUserIds.length.toString(), inline: true },
+            { name: '⏰ Hora', value: time(new Date(), TimestampStyles.LongDateTime), inline: true },
+          )
+          .setTimestamp();
+
+        const mentionContent = config.alertRoleId ? `<@&${config.alertRoleId}>` : '';
+
+        await alertChannel.send({
+          content: `🚨 **LOCKDOWN ACTIVADO** ${mentionContent}`,
+          embeds: [embed],
+        }).catch(() => null);
+      }
+    }
+
+    logger.warn(`[AntiRaid] Lockdown activo en ${guild.name}`);
+  }
+
+  // ================================
+  // DESACTIVAR LOCKDOWN
+  // ================================
+
+  async deactivateLockdown(guild: Guild, moderatorId: string): Promise<boolean> {
+    const config = await this.getConfig(guild.id);
+    if (!config?.lockdownActive) return false;
+
+    // Restaurar permisos de canales
+    const textChannels = guild.channels.cache.filter((c) => c.type === ChannelType.GuildText);
+
+    for (const [, channel] of textChannels.entries()) {
+      await (channel as TextChannel).permissionOverwrites
+        .edit(guild.roles.everyone, { SendMessages: null })
+        .catch(() => null);
+    }
+
+    // Actualizar BD
+    await prisma.antiRaidConfig.update({
+      where: { guildId: guild.id },
+      data: { lockdownActive: false, lockdownAt: null },
+    });
+
+    if (config.alertChannelId) {
+      const alertChannel = guild.channels.cache.get(config.alertChannelId) as TextChannel;
+      if (alertChannel) {
+        await alertChannel.send({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(Colors.SUCCESS)
+              .setTitle('✅ Lockdown Desactivado')
+              .addFields({ name: '👤 Desactivado por', value: userMention(moderatorId) })
+              .setTimestamp(),
+          ],
+        }).catch(() => null);
+      }
+    }
+
+    return true;
+  }
+
+  private async getConfig(guildId: string) {
+    return cacheWithFallback(
+      CacheKeys.antiRaidConfig(guildId),
+      () => prisma.antiRaidConfig.findUnique({ where: { guildId } }),
+      300
+    );
+  }
+}
+
+// ================================
+// INICIALIZACIÓN
+// ================================
+
+export async function initAntiRaid(client: GuardianClient): Promise<void> {
+  const system = new AntiRaidSystem();
+
+  client.on('guildMemberAdd', async (member) => {
+    try {
+      await system.onMemberJoin(member.guild, member);
+    } catch (error) {
+      logger.error('[AntiRaid] Error en guildMemberAdd:', error);
+    }
+  });
+
+  client.on('channelCreate', async (channel) => {
+    if (!channel.guild) return;
+    try {
+      await system.onChannelCreate(channel.guild, channel as GuildChannel);
+    } catch (error) {
+      logger.error('[AntiRaid] Error en channelCreate:', error);
+    }
+  });
+
+  client.on('channelDelete', async (channel) => {
+    if (!('guild' in channel) || !channel.guild) return;
+    try {
+      await system.onChannelDelete(channel.guild, channel as GuildChannel);
+    } catch (error) {
+      logger.error('[AntiRaid] Error en channelDelete:', error);
+    }
+  });
+
+  client.on('roleCreate', async (role) => {
+    try {
+      await system.onRoleCreate(role.guild, role);
+    } catch (error) {
+      logger.error('[AntiRaid] Error en roleCreate:', error);
+    }
+  });
+
+  logger.info('[AntiRaid] Sistema antiraid activo');
+}
+
+/**
+ * GUARDIAN BOT - Automod Engine
+ * Motor de automoderación con detección avanzada
+ */
+
+import { Message, GuildMember, PermissionFlagsBits } from 'discord.js';
+import { prisma } from '../database/client';
+import { redis, cacheWithFallback, CacheKeys, incrementCounter } from '../database/redis';
+import { ModerationService } from '../services/moderationService';
+import { logger } from '../utils/logger';
+import type { AutomodViolation, AutomodViolationType } from '../types';
+import type { GuardianClient } from '../bot';
+
+// Dominios de phishing conocidos (se actualizan periódicamente)
+const PHISHING_DOMAINS = new Set([
+  'discord-nitro.gift', 'discordgift.site', 'discord-app.com', 'dlscord.com',
+  'discords.gift', 'discordnitrogift.com', 'free-nitro.ru', 'steamcommunily.com',
+]);
+
+// Patrones de scam
+const SCAM_PATTERNS = [
+  /free\s*nitro/i, /discord.*nitro.*gift/i, /get\s*nitro\s*free/i,
+  /click.*claim.*prize/i, /you.*won.*gift/i, /congratulations.*winner/i,
+];
+
+// Patrones de phishing
+const PHISHING_PATTERNS = [
+  /steam.*trade.*login/i, /verify.*account.*click/i,
+  /account.*suspended.*verify/i, /unusual.*activity.*confirm/i,
+];
+
+export class AutomodEngine {
+  private botId: string;
+
+  constructor(botId: string) {
+    this.botId = botId;
+  }
+
+  // ================================
+  // PUNTO DE ENTRADA
+  // ================================
+
+  async check(message: Message): Promise<AutomodViolation | null> {
+    if (!message.guild || !message.member) return null;
+    if (message.author.bot) return null;
+    if (message.member.permissions.has(PermissionFlagsBits.Administrator)) return null;
+
+    const config = await this.getConfig(message.guild.id);
+    if (!config?.enabled) return null;
+
+    // Verificar si el canal o rol está exento
+    if (config.whitelistChannels.includes(message.channelId)) return null;
+    const memberRoles = message.member.roles.cache.map((r) => r.id);
+    if (memberRoles.some((r) => config.whitelistRoles.includes(r))) return null;
+
+    // Ejecutar verificaciones en orden de prioridad
+    const checks = [
+      config.antiPhishing && this.checkPhishing(message),
+      config.antiScam && this.checkScam(message),
+      config.antiInvites && this.checkInvites(message, config),
+      config.antiSpam && this.checkSpam(message, config),
+      config.antiFlood && this.checkFlood(message, config),
+      config.antiMassMentions && this.checkMassMentions(message, config),
+      config.antiRepeat && this.checkDuplicate(message, config),
+      config.badWords && this.checkBadWords(message, config),
+      config.suspiciousLinks && this.checkSuspiciousLinks(message),
+    ].filter(Boolean);
+
+    for (const check of checks) {
+      const result = await (check as Promise<AutomodViolation | null>);
+      if (result) return result;
+    }
+
+    return null;
+  }
+
+  // ================================
+  // APLICAR SANCIÓN
+  // ================================
+
+  async applyAction(message: Message, violation: AutomodViolation): Promise<void> {
+    if (!message.guild || !message.member) return;
+
+    // Borrar mensaje
+    await message.delete().catch(() => null);
+
+    const botId = this.botId;
+    const opts = {
+      guildId: message.guild.id,
+      targetId: message.author.id,
+      moderatorId: botId,
+      reason: `[AutoMod] ${violation.reason}`,
+      silent: true,
+    };
+
+    switch (violation.action) {
+      case 'WARN':
+        await ModerationService.warn(message.guild, { ...opts, action: 'WARN' });
+        break;
+      case 'TIMEOUT':
+        await ModerationService.timeout(message.guild, {
+          ...opts,
+          action: 'TIMEOUT',
+          duration: 300, // 5 minutos por defecto
+        });
+        break;
+      case 'KICK':
+        await ModerationService.kick(message.guild, { ...opts, action: 'KICK' });
+        break;
+      case 'BAN':
+        await ModerationService.ban(message.guild, { ...opts, action: 'BAN' });
+        break;
+    }
+
+    // Notificar en el canal (se borra tras 5s)
+    try {
+      const notification = await message.channel.send({
+        content: `⚠️ **${message.author.tag}** - ${violation.reason}`,
+      });
+      setTimeout(() => notification.delete().catch(() => null), 5000);
+    } catch {
+      // Ignorar si no se puede enviar
+    }
+
+    logger.info(
+      `[AutoMod] ${violation.type} detectado de ${message.author.tag} en ${message.guild.name}: ${violation.reason}`
+    );
+  }
+
+  // ================================
+  // CHECKS INDIVIDUALES
+  // ================================
+
+  private async checkPhishing(message: Message): Promise<AutomodViolation | null> {
+    const content = message.content.toLowerCase();
+
+    // Verificar URLs contra lista de phishing
+    const urlRegex = /https?:\/\/([^\s/]+)/g;
+    let match;
+    while ((match = urlRegex.exec(content)) !== null) {
+      const domain = match[1]?.toLowerCase() ?? '';
+      if (PHISHING_DOMAINS.has(domain)) {
+        return {
+          type: 'PHISHING',
+          severity: 'CRITICAL',
+          action: 'BAN',
+          reason: `Enlace de phishing detectado: ${domain}`,
+          content: message.content,
+        };
+      }
+    }
+
+    // Verificar patrones de phishing
+    for (const pattern of PHISHING_PATTERNS) {
+      if (pattern.test(content)) {
+        return {
+          type: 'PHISHING',
+          severity: 'CRITICAL',
+          action: 'BAN',
+          reason: 'Intento de phishing detectado',
+          content: message.content,
+        };
+      }
+    }
+
+    return null;
+  }
+
+  private async checkScam(message: Message): Promise<AutomodViolation | null> {
+    const content = message.content.toLowerCase();
+
+    for (const pattern of SCAM_PATTERNS) {
+      if (pattern.test(content)) {
+        return {
+          type: 'SCAM',
+          severity: 'HIGH',
+          action: 'BAN',
+          reason: 'Mensaje de estafa detectado',
+          content: message.content,
+        };
+      }
+    }
+
+    return null;
+  }
+
+  private async checkInvites(message: Message, config: any): Promise<AutomodViolation | null> {
+    const inviteRegex = /discord(?:\.gg|app\.com\/invite|\.com\/invite)\/([a-zA-Z0-9-]+)/g;
+    if (inviteRegex.test(message.content)) {
+      return {
+        type: 'INVITE',
+        severity: 'MEDIUM',
+        action: config.inviteAction ?? 'WARN',
+        reason: 'Enlace de invitación de Discord no permitido',
+        content: message.content,
+      };
+    }
+    return null;
+  }
+
+  private async checkSpam(message: Message, config: any): Promise<AutomodViolation | null> {
+    const key = CacheKeys.memberSpam(message.guild!.id, message.author.id);
+    const count = await incrementCounter(key, 5); // 5 segundos ventana
+
+    if (count > (config.spamThreshold ?? 5)) {
+      return {
+        type: 'SPAM',
+        severity: 'HIGH',
+        action: config.spamAction ?? 'TIMEOUT',
+        reason: `Spam detectado: ${count} mensajes en 5 segundos`,
+      };
+    }
+    return null;
+  }
+
+  private async checkFlood(message: Message, config: any): Promise<AutomodViolation | null> {
+    const threshold = config.floodThreshold ?? 1000;
+    if (message.content.length > threshold) {
+      return {
+        type: 'FLOOD',
+        severity: 'MEDIUM',
+        action: 'WARN',
+        reason: `Mensaje demasiado largo: ${message.content.length} caracteres`,
+      };
+    }
+    return null;
+  }
+
+  private async checkMassMentions(message: Message, config: any): Promise<AutomodViolation | null> {
+    const mentions = message.mentions.users.size + message.mentions.roles.size;
+    const threshold = config.mentionThreshold ?? 10;
+
+    if (mentions > threshold) {
+      return {
+        type: 'MASS_MENTIONS',
+        severity: 'HIGH',
+        action: 'TIMEOUT',
+        reason: `Menciones masivas: ${mentions} menciones en un mensaje`,
+      };
+    }
+    return null;
+  }
+
+  private async checkDuplicate(message: Message, config: any): Promise<AutomodViolation | null> {
+    const key = `duplicate:${message.guild!.id}:${message.author.id}`;
+    const history = await redis.lrange(key, 0, (config.duplicateThreshold ?? 3) - 1);
+
+    const isDuplicate = history.includes(message.content);
+    await redis.lpush(key, message.content);
+    await redis.ltrim(key, 0, 9);
+    await redis.expire(key, 30);
+
+    if (isDuplicate) {
+      const dupCount = history.filter((m) => m === message.content).length + 1;
+      if (dupCount >= (config.duplicateThreshold ?? 3)) {
+        return {
+          type: 'DUPLICATE',
+          severity: 'MEDIUM',
+          action: 'WARN',
+          reason: `Mensajes duplicados detectados (${dupCount} veces)`,
+          content: message.content,
+        };
+      }
+    }
+
+    return null;
+  }
+
+  private async checkBadWords(message: Message, config: any): Promise<AutomodViolation | null> {
+    const content = message.content.toLowerCase();
+    const bannedWords: string[] = config.bannedWords ?? [];
+
+    for (const word of bannedWords) {
+      if (content.includes(word.toLowerCase())) {
+        return {
+          type: 'BAD_WORDS',
+          severity: 'LOW',
+          action: 'WARN',
+          reason: 'Lenguaje no permitido',
+          content: message.content,
+        };
+      }
+    }
+
+    return null;
+  }
+
+  private async checkSuspiciousLinks(message: Message): Promise<AutomodViolation | null> {
+    const urlRegex = /https?:\/\/[^\s]+/g;
+    const urls = message.content.match(urlRegex) ?? [];
+
+    for (const url of urls) {
+      // URL shorteners sospechosos
+      if (/bit\.ly|tinyurl|t\.co|goo\.gl|is\.gd|ow\.ly/.test(url)) {
+        return {
+          type: 'SUSPICIOUS_LINK',
+          severity: 'LOW',
+          action: 'WARN',
+          reason: 'Enlace acortado sospechoso detectado',
+          content: url,
+        };
+      }
+    }
+
+    return null;
+  }
+
+  // ================================
+  // CONFIG
+  // ================================
+
+  private async getConfig(guildId: string) {
+    return cacheWithFallback(
+      CacheKeys.automodConfig(guildId),
+      () => prisma.automodConfig.findUnique({ where: { guildId } }),
+      300
+    );
+  }
+}
+
+// ================================
+// INICIALIZACIÓN DEL MÓDULO
+// ================================
+
+export async function initAutomod(client: GuardianClient): Promise<void> {
+  const engine = new AutomodEngine(client.user?.id ?? '');
+
+  client.on('messageCreate', async (message) => {
+    if (!message.guild || message.author.bot) return;
+
+    try {
+      const violation = await engine.check(message);
+      if (violation) {
+        await engine.applyAction(message, violation);
+      }
+    } catch (error) {
+      logger.error('[AutoMod] Error procesando mensaje:', error);
+    }
+  });
+
+  logger.info('[AutoMod] Motor de automoderación activo');
+}
+
+/**
+ * GUARDIAN BOT - Ticket Service
+ * Gestión completa de tickets premium
+ */
+
+import {
+  Guild,
+  CategoryChannel,
+  ChannelType,
+  PermissionFlagsBits,
+  EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  TextChannel,
+  OverwriteType,
+  userMention,
+  time,
+  TimestampStyles,
+} from 'discord.js';
+import { prisma } from '../database/client';
+import { cacheWithFallback, CacheKeys } from '../database/redis';
+import { Colors } from '../types';
+import { logger } from '../utils/logger';
+
+export class TicketService {
+
+  // ================================
+  // CREAR TICKET
+  // ================================
+
+  static async createTicket(
+    guild: Guild,
+    userId: string,
+    category: string,
+    subject?: string
+  ): Promise<{ success: boolean; channelId?: string; error?: string }> {
+    try {
+      const config = await cacheWithFallback(
+        CacheKeys.ticketConfig(guild.id),
+        () => prisma.ticketConfig.findUnique({ where: { guildId: guild.id } }),
+        300
+      );
+
+      if (!config?.enabled) {
+        return { success: false, error: 'El sistema de tickets no está habilitado.' };
+      }
+
+      // Verificar límite de tickets abiertos por usuario
+      const openTickets = await prisma.ticket.count({
+        where: {
+          guildId: guild.id,
+          userId,
+          status: { in: ['OPEN', 'CLAIMED'] },
+        },
+      });
+
+      if (openTickets >= config.maxTickets) {
+        return { success: false, error: `Ya tienes ${openTickets} ticket(s) abierto(s). Ciérralos antes de abrir uno nuevo.` };
+      }
+
+      // Número de ticket secuencial
+      const lastTicket = await prisma.ticket.findFirst({
+        where: { guildId: guild.id },
+        orderBy: { ticketNumber: 'desc' },
+      });
+      const ticketNumber = (lastTicket?.ticketNumber ?? 0) + 1;
+
+      // Crear canal
+      const categoryChannel = config.categoryId
+        ? guild.channels.cache.get(config.categoryId) as CategoryChannel
+        : null;
+
+      const member = await guild.members.fetch(userId).catch(() => null);
+
+      const channel = await guild.channels.create({
+        name: `ticket-${ticketNumber.toString().padStart(4, '0')}`,
+        type: ChannelType.GuildText,
+        parent: categoryChannel ?? undefined,
+        topic: `Ticket #${ticketNumber} | ${category} | ${userId}`,
+        permissionOverwrites: [
+          // Ocultar al @everyone
+          { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
+          // Permitir al usuario
+          ...(member ? [{
+            id: member.id,
+            allow: [
+              PermissionFlagsBits.ViewChannel,
+              PermissionFlagsBits.SendMessages,
+              PermissionFlagsBits.ReadMessageHistory,
+              PermissionFlagsBits.AttachFiles,
+              PermissionFlagsBits.EmbedLinks,
+            ],
+          }] : []),
+          // Permitir al staff
+          ...config.staffRoleIds.map((roleId) => ({
+            id: roleId,
+            allow: [
+              PermissionFlagsBits.ViewChannel,
+              PermissionFlagsBits.SendMessages,
+              PermissionFlagsBits.ReadMessageHistory,
+              PermissionFlagsBits.ManageMessages,
+              PermissionFlagsBits.AttachFiles,
+            ],
+          })),
+        ],
+      });
+
+      // Guardar en BD
+      const ticket = await prisma.ticket.create({
+        data: {
+          ticketNumber,
+          guildId: guild.id,
+          channelId: channel.id,
+          userId,
+          category: category as any,
+          subject,
+          status: 'OPEN',
+        },
+      });
+
+      // Upsert usuario
+      await prisma.user.upsert({
+        where: { id: userId },
+        update: {},
+        create: { id: userId, username: member?.user.username ?? 'Unknown' },
+      });
+
+      // Mensaje de bienvenida en el ticket
+      const welcomeEmbed = new EmbedBuilder()
+        .setColor(Colors.TICKET)
+        .setTitle(`🎫 Ticket #${ticketNumber}`)
+        .setDescription(
+          `Bienvenido ${userMention(userId)}!\n\n` +
+          `Tu ticket ha sido creado en la categoría **${category}**.\n` +
+          `Un miembro del staff te atenderá pronto.\n\n` +
+          (subject ? `**Asunto:** ${subject}` : 'Por favor describe tu consulta.')
+        )
+        .addFields({ name: '⏰ Abierto', value: time(new Date(), TimestampStyles.RelativeTime) })
+        .setTimestamp();
+
+      const controlRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`ticket:claim:${ticket.id}`)
+          .setLabel('📋 Reclamar')
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+          .setCustomId(`ticket:close:${ticket.id}`)
+          .setLabel('🔒 Cerrar')
+          .setStyle(ButtonStyle.Danger),
+        new ButtonBuilder()
+          .setCustomId(`ticket:transcript:${ticket.id}`)
+          .setLabel('📄 Transcript')
+          .setStyle(ButtonStyle.Secondary),
+      );
+
+      await channel.send({
+        content: `${userMention(userId)} ${config.staffRoleIds.map((r) => `<@&${r}>`).join(' ')}`,
+        embeds: [welcomeEmbed],
+        components: [controlRow],
+      });
+
+      // Log de apertura
+      if (config.logChannelId) {
+        const logChannel = guild.channels.cache.get(config.logChannelId) as TextChannel;
+        if (logChannel) {
+          await logChannel.send({
+            embeds: [
+              new EmbedBuilder()
+                .setColor(Colors.SUCCESS)
+                .setTitle('🎫 Nuevo Ticket')
+                .addFields(
+                  { name: '👤 Usuario', value: userMention(userId), inline: true },
+                  { name: '📂 Categoría', value: category, inline: true },
+                  { name: '🔢 Número', value: `#${ticketNumber}`, inline: true },
+                  { name: '📍 Canal', value: channel.toString() },
+                )
+                .setTimestamp(),
+            ],
+          });
+        }
+      }
+
+      return { success: true, channelId: channel.id };
+    } catch (error) {
+      logger.error('[TicketService] Error creando ticket:', error);
+      return { success: false, error: 'Error interno al crear el ticket.' };
+    }
+  }
+
+  // ================================
+  // CERRAR TICKET
+  // ================================
+
+  static async closeTicket(
+    guild: Guild,
+    ticketId: string,
+    closedBy: string,
+    reason?: string
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      const ticket = await prisma.ticket.findUnique({ where: { id: ticketId } });
+      if (!ticket) return { success: false, error: 'Ticket no encontrado.' };
+      if (ticket.status === 'CLOSED') return { success: false, error: 'El ticket ya está cerrado.' };
+
+      // Generar transcript
+      await this.generateTranscript(guild, ticket.channelId, ticketId);
+
+      // Actualizar BD
+      await prisma.ticket.update({
+        where: { id: ticketId },
+        data: {
+          status: 'CLOSED',
+          closedBy,
+          closedAt: new Date(),
+          closeReason: reason,
+        },
+      });
+
+      const channel = guild.channels.cache.get(ticket.channelId) as TextChannel;
+      if (channel) {
+        const embed = new EmbedBuilder()
+          .setColor(Colors.ERROR)
+          .setTitle('🔒 Ticket Cerrado')
+          .addFields(
+            { name: '👤 Cerrado por', value: userMention(closedBy), inline: true },
+            { name: '⏰ Hora', value: time(new Date(), TimestampStyles.ShortDateTime), inline: true },
+          )
+          .setTimestamp();
+
+        if (reason) embed.addFields({ name: '📝 Motivo', value: reason });
+
+        const reopenRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder()
+            .setCustomId(`ticket:reopen:${ticketId}`)
+            .setLabel('🔓 Reabrir')
+            .setStyle(ButtonStyle.Success),
+          new ButtonBuilder()
+            .setCustomId(`ticket:delete:${ticketId}`)
+            .setLabel('🗑️ Eliminar canal')
+            .setStyle(ButtonStyle.Danger),
+        );
+
+        await channel.send({ embeds: [embed], components: [reopenRow] });
+
+        // Revocar acceso al usuario
+        await channel.permissionOverwrites.edit(ticket.userId, {
+          SendMessages: false,
+        }).catch(() => null);
+
+        await channel.setName(`closed-${ticket.ticketNumber.toString().padStart(4, '0')}`).catch(() => null);
+      }
+
+      return { success: true };
+    } catch (error) {
+      logger.error('[TicketService] Error cerrando ticket:', error);
+      return { success: false, error: 'Error interno al cerrar el ticket.' };
+    }
+  }
+
+  // ================================
+  // GENERAR TRANSCRIPT
+  // ================================
+
+  static async generateTranscript(
+    guild: Guild,
+    channelId: string,
+    ticketId: string
+  ): Promise<string | null> {
+    try {
+      const channel = guild.channels.cache.get(channelId) as TextChannel;
+      if (!channel) return null;
+
+      // Obtener mensajes (máx 500)
+      const messages = await channel.messages.fetch({ limit: 100 });
+      const sortedMessages = [...messages.values()].reverse();
+
+      // Generar HTML
+      const html = generateHtmlTranscript(sortedMessages, channel.name);
+
+      // Guardar transcript
+      await prisma.ticketTranscript.upsert({
+        where: { ticketId },
+        update: { htmlContent: html },
+        create: { ticketId, htmlContent: html },
+      });
+
+      return html;
+    } catch (error) {
+      logger.error('[TicketService] Error generando transcript:', error);
+      return null;
+    }
+  }
+}
+
+// ================================
+// HTML TRANSCRIPT GENERATOR
+// ================================
+
+function generateHtmlTranscript(messages: any[], channelName: string): string {
+  const rows = messages.map((msg) => {
+    const time = new Date(msg.createdTimestamp).toLocaleString('es-ES');
+    const content = msg.content ? escapeHtml(msg.content) : '<em>Sin contenido</em>';
+    const attachments = msg.attachments.size > 0
+      ? `<div class="attachments">${[...msg.attachments.values()].map((a: any) =>
+          a.contentType?.startsWith('image/')
+            ? `<img src="${a.url}" alt="attachment" style="max-width:300px;">`
+            : `<a href="${a.url}">${a.name}</a>`
+        ).join('')}</div>`
+      : '';
+
+    return `
+      <div class="message ${msg.author.bot ? 'bot' : ''}">
+        <div class="avatar"><img src="${msg.author.displayAvatarURL({ size: 32 })}" alt=""></div>
+        <div class="content">
+          <div class="header">
+            <span class="author" style="color: ${msg.member?.displayHexColor ?? '#fff'}">${escapeHtml(msg.author.tag)}</span>
+            <span class="time">${time}</span>
+          </div>
+          <div class="text">${content}</div>
+          ${attachments}
+        </div>
+      </div>`;
+  }).join('');
+
+  return `<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>Transcript: ${channelName}</title>
+  <style>
+    body { background: #36393f; color: #dcddde; font-family: 'Segoe UI', sans-serif; margin: 0; padding: 20px; }
+    h1 { color: #fff; border-bottom: 1px solid #4f545c; padding-bottom: 10px; }
+    .message { display: flex; gap: 12px; padding: 4px 0; margin: 2px 0; }
+    .message:hover { background: rgba(255,255,255,0.05); border-radius: 4px; }
+    .avatar img { width: 40px; height: 40px; border-radius: 50%; }
+    .header { display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px; }
+    .author { font-weight: 600; }
+    .time { font-size: 0.75rem; color: #72767d; }
+    .text { line-height: 1.5; }
+    .bot .author::after { content: 'BOT'; background: #5865f2; color: white; font-size: 0.65rem; padding: 1px 4px; border-radius: 3px; margin-left: 4px; }
+    .attachments { margin-top: 8px; }
+    .attachments img { border-radius: 4px; display: block; margin: 4px 0; }
+    .attachments a { color: #00b0f4; }
+  </style>
+</head>
+<body>
+  <h1>📋 Transcript: #${channelName}</h1>
+  <p>Generado: ${new Date().toLocaleString('es-ES')}</p>
+  <div class="messages">${rows}</div>
+</body>
+</html>`;
+}
+
+function escapeHtml(str: string): string {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+/**
+ * GUARDIAN BOT - /case Command
+ * Ver y gestionar casos de moderación
+ */
+
+import {
+  SlashCommandBuilder,
+  PermissionFlagsBits,
+  EmbedBuilder,
+  userMention,
+  time,
+  TimestampStyles,
+} from 'discord.js';
+import { prisma } from '../../database/client';
+import { Colors, type Command } from '../../types';
+import { formatDuration } from '../../utils/duration';
+
+const command: Command = {
+  data: new SlashCommandBuilder()
+    .setName('case')
+    .setDescription('Ver o editar un caso de moderación')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
+    .addSubcommand((sub) =>
+      sub.setName('ver').setDescription('Ver un caso específico')
+        .addIntegerOption((opt) => opt.setName('numero').setDescription('Número del caso').setRequired(true).setMinValue(1))
+    )
+    .addSubcommand((sub) =>
+      sub.setName('editar').setDescription('Editar la razón de un caso')
+        .addIntegerOption((opt) => opt.setName('numero').setDescription('Número del caso').setRequired(true).setMinValue(1))
+        .addStringOption((opt) => opt.setName('razon').setDescription('Nueva razón').setRequired(true).setMaxLength(512))
+    )
+    .addSubcommand((sub) =>
+      sub.setName('lista').setDescription('Ver todos los casos de un usuario')
+        .addUserOption((opt) => opt.setName('usuario').setDescription('Usuario').setRequired(true))
+        .addIntegerOption((opt) => opt.setName('pagina').setDescription('Página').setMinValue(1))
+    ),
+
+  category: 'moderation',
+  permissions: [PermissionFlagsBits.ModerateMembers],
+  guildOnly: true,
+
+  async execute(interaction) {
+    if (!interaction.guild) return;
+    const sub = interaction.options.getSubcommand();
+
+    // ---- VER CASO ----
+    if (sub === 'ver') {
+      const caseNum = interaction.options.getInteger('numero', true);
+
+      await interaction.deferReply({ ephemeral: true });
+
+      const caseRecord = await prisma.moderationCase.findUnique({
+        where: { guildId_caseNumber: { guildId: interaction.guild.id, caseNumber: caseNum } },
+        include: { moderation: true },
+      });
+
+      if (!caseRecord) {
+        await interaction.editReply({
+          embeds: [new EmbedBuilder().setColor(Colors.ERROR).setDescription(`❌ Caso #${caseNum} no encontrado.`)],
+        });
+        return;
+      }
+
+      const embed = new EmbedBuilder()
+        .setColor(Colors.INFO)
+        .setTitle(`📋 Caso #${caseRecord.caseNumber}`)
+        .addFields(
+          { name: '📌 Tipo', value: caseRecord.type, inline: true },
+          { name: '👤 Usuario', value: userMention(caseRecord.targetId), inline: true },
+          { name: '🛡️ Moderador', value: userMention(caseRecord.moderatorId), inline: true },
+          { name: '📝 Razón', value: caseRecord.reason },
+          { name: '📅 Fecha', value: time(caseRecord.createdAt, TimestampStyles.LongDateTime), inline: true },
+        );
+
+      if (caseRecord.moderation.duration) {
+        embed.addFields({
+          name: '⏱️ Duración',
+          value: formatDuration(caseRecord.moderation.duration),
+          inline: true,
+        });
+      }
+
+      if (caseRecord.editedReason) {
+        embed.addFields({
+          name: '✏️ Razón editada',
+          value: `${caseRecord.editedReason}\n*por ${userMention(caseRecord.editedBy!)} el ${time(caseRecord.editedAt!, TimestampStyles.ShortDateTime)}*`,
+        });
+      }
+
+      if (caseRecord.evidence.length > 0) {
+        embed.addFields({ name: '🔗 Evidencias', value: caseRecord.evidence.join('\n') });
+      }
+
+      embed.setFooter({ text: `Estado: ${caseRecord.moderation.status}` });
+
+      await interaction.editReply({ embeds: [embed] });
+    }
+
+    // ---- EDITAR CASO ----
+    else if (sub === 'editar') {
+      const caseNum = interaction.options.getInteger('numero', true);
+      const newReason = interaction.options.getString('razon', true);
+
+      await interaction.deferReply({ ephemeral: true });
+
+      const caseRecord = await prisma.moderationCase.findUnique({
+        where: { guildId_caseNumber: { guildId: interaction.guild.id, caseNumber: caseNum } },
+      });
+
+      if (!caseRecord) {
+        await interaction.editReply({
+          embeds: [new EmbedBuilder().setColor(Colors.ERROR).setDescription(`❌ Caso #${caseNum} no encontrado.`)],
+        });
+        return;
+      }
+
+      await prisma.moderationCase.update({
+        where: { id: caseRecord.id },
+        data: {
+          editedReason: newReason,
+          editedBy: interaction.user.id,
+          editedAt: new Date(),
+        },
+      });
+
+      const embed = new EmbedBuilder()
+        .setColor(Colors.SUCCESS)
+        .setTitle(`✏️ Caso #${caseNum} Actualizado`)
+        .addFields(
+          { name: '📝 Razón anterior', value: caseRecord.reason },
+          { name: '📝 Nueva razón', value: newReason },
+        )
+        .setTimestamp();
+
+      await interaction.editReply({ embeds: [embed] });
+    }
+
+    // ---- LISTA DE CASOS ----
+    else if (sub === 'lista') {
+      const target = interaction.options.getUser('usuario', true);
+      const page = interaction.options.getInteger('pagina') ?? 1;
+      const perPage = 10;
+
+      await interaction.deferReply({ ephemeral: true });
+
+      const [cases, total] = await Promise.all([
+        prisma.moderationCase.findMany({
+          where: { guildId: interaction.guild.id, targetId: target.id },
+          orderBy: { caseNumber: 'desc' },
+          skip: (page - 1) * perPage,
+          take: perPage,
+        }),
+        prisma.moderationCase.count({
+          where: { guildId: interaction.guild.id, targetId: target.id },
+        }),
+      ]);
+
+      if (total === 0) {
+        await interaction.editReply({
+          embeds: [new EmbedBuilder().setColor(Colors.INFO).setDescription(`✅ ${target.tag} no tiene casos registrados.`)],
+        });
+        return;
+      }
+
+      const embed = new EmbedBuilder()
+        .setColor(Colors.INFO)
+        .setTitle(`📋 Casos de ${target.tag}`)
+        .setDescription(
+          cases.map((c) =>
+            `**#${c.caseNumber}** | \`${c.type}\` | ${time(c.createdAt, TimestampStyles.ShortDate)} | ${c.reason.slice(0, 50)}${c.reason.length > 50 ? '...' : ''}`
+          ).join('\n')
+        )
+        .setFooter({ text: `Total: ${total} casos | Página ${page}/${Math.ceil(total / perPage)}` })
+        .setTimestamp();
+
+      await interaction.editReply({ embeds: [embed] });
+    }
+  },
+};
+
+export default command;
+
+/**
+ * GUARDIAN BOT - /timeout Command
+ */
+
+import {
+  SlashCommandBuilder,
+  PermissionFlagsBits,
+  EmbedBuilder,
+  userMention,
+} from 'discord.js';
+import { ModerationService } from '../../services/moderationService';
+import { Colors, type Command } from '../../types';
+import { parseDuration, validateDuration } from '../../utils/duration';
+
+const command: Command = {
+  data: new SlashCommandBuilder()
+    .setName('timeout')
+    .setDescription('Aplica un timeout (silencio temporal) a un usuario')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
+    .addUserOption((opt) =>
+      opt.setName('usuario').setDescription('Usuario').setRequired(true)
+    )
+    .addStringOption((opt) =>
+      opt.setName('duracion').setDescription('Duración: 10m, 1h, 1d (máx 28d)').setRequired(true)
+    )
+    .addStringOption((opt) =>
+      opt.setName('razon').setDescription('Razón').setRequired(true).setMaxLength(512)
+    ),
+
+  category: 'moderation',
+  permissions: [PermissionFlagsBits.ModerateMembers],
+  botPermissions: [PermissionFlagsBits.ModerateMembers],
+  guildOnly: true,
+
+  async execute(interaction) {
+    const target = interaction.options.getUser('usuario', true);
+    const durationStr = interaction.options.getString('duracion', true);
+    const reason = interaction.options.getString('razon', true);
+
+    if (!interaction.guild) return;
+
+    const parsed = parseDuration(durationStr);
+    if (!parsed) {
+      await interaction.reply({
+        embeds: [new EmbedBuilder().setColor(Colors.ERROR).setDescription('❌ Duración inválida. Ejemplo: `10m`, `1h`, `7d`')],
+        ephemeral: true,
+      });
+      return;
+    }
+
+    const validationError = validateDuration(parsed.seconds, 2419200); // 28 días
+    if (validationError) {
+      await interaction.reply({
+        embeds: [new EmbedBuilder().setColor(Colors.ERROR).setDescription(`❌ ${validationError}`)],
+        ephemeral: true,
+      });
+      return;
+    }
+
+    await interaction.deferReply({ ephemeral: true });
+
+    const result = await ModerationService.timeout(interaction.guild, {
+      guildId: interaction.guild.id,
+      targetId: target.id,
+      moderatorId: interaction.user.id,
+      action: 'TIMEOUT',
+      reason,
+      duration: parsed.seconds,
+    });
+
+    if (!result.success) {
+      await interaction.editReply({
+        embeds: [new EmbedBuilder().setColor(Colors.ERROR).setDescription(`❌ ${result.error}`)],
+      });
+      return;
+    }
+
+    const embed = new EmbedBuilder()
+      .setColor(Colors.WARNING)
+      .setTitle('⏰ Timeout Aplicado')
+      .addFields(
+        { name: '👤 Usuario', value: `${target.tag} (${userMention(target.id)})`, inline: true },
+        { name: '⏱️ Duración', value: parsed.formatted, inline: true },
+        { name: '🆔 Caso', value: `#${result.caseNumber}`, inline: true },
+        { name: '📝 Razón', value: reason },
+      )
+      .setTimestamp();
+
+    await interaction.editReply({ embeds: [embed] });
+  },
+};
+
+export default command;
+
+/**
+ * GUARDIAN BOT - /warn Command
+ */
+
+import {
+  SlashCommandBuilder,
+  PermissionFlagsBits,
+  EmbedBuilder,
+  userMention,
+} from 'discord.js';
+import { ModerationService } from '../../services/moderationService';
+import { Colors, type Command } from '../../types';
+import { prisma } from '../../database/client';
+
+const command: Command = {
+  data: new SlashCommandBuilder()
+    .setName('warn')
+    .setDescription('Advierte a un usuario')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
+    .addUserOption((opt) =>
+      opt.setName('usuario').setDescription('Usuario a advertir').setRequired(true)
+    )
+    .addStringOption((opt) =>
+      opt.setName('razon').setDescription('Razón de la advertencia').setRequired(true).setMaxLength(512)
+    )
+    .addIntegerOption((opt) =>
+      opt.setName('puntos').setDescription('Puntos de la advertencia (1-5)').setMinValue(1).setMaxValue(5)
+    ),
+
+  category: 'moderation',
+  permissions: [PermissionFlagsBits.ModerateMembers],
+  guildOnly: true,
+
+  async execute(interaction) {
+    const target = interaction.options.getUser('usuario', true);
+    const reason = interaction.options.getString('razon', true);
+    const points = interaction.options.getInteger('puntos') ?? 1;
+
+    if (!interaction.guild) return;
+
+    await interaction.deferReply({ ephemeral: true });
+
+    const result = await ModerationService.warn(interaction.guild, {
+      guildId: interaction.guild.id,
+      targetId: target.id,
+      moderatorId: interaction.user.id,
+      action: 'WARN',
+      reason,
+      points,
+    });
+
+    if (!result.success) {
+      await interaction.editReply({
+        embeds: [new EmbedBuilder().setColor(Colors.ERROR).setDescription(`❌ ${result.error}`)],
+      });
+      return;
+    }
+
+    // Obtener total de warns
+    const totalWarnings = await prisma.warning.count({
+      where: { guildId: interaction.guild.id, userId: target.id, active: true },
+    });
+
+    const embed = new EmbedBuilder()
+      .setColor(Colors.MOD)
+      .setTitle('⚠️ Advertencia Emitida')
+      .addFields(
+        { name: '👤 Usuario', value: `${target.tag} (${userMention(target.id)})`, inline: true },
+        { name: '🆔 Caso', value: `#${result.caseNumber}`, inline: true },
+        { name: '📝 Razón', value: reason },
+        { name: '📊 Total advertencias', value: `${totalWarnings} activa${totalWarnings !== 1 ? 's' : ''}`, inline: true },
+        { name: '⚡ Puntos añadidos', value: points.toString(), inline: true },
+      )
+      .setTimestamp();
+
+    await interaction.editReply({ embeds: [embed] });
+  },
+};
+
+export default command;
+
+/**
+ * GUARDIAN BOT - /ban Command
+ */
+
+import {
+  SlashCommandBuilder,
+  PermissionFlagsBits,
+  EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  ComponentType,
+  userMention,
+} from 'discord.js';
+import { ModerationService } from '../../services/moderationService';
+import { Colors, type Command } from '../../types';
+import { parseDuration } from '../../utils/duration';
+
+const command: Command = {
+  data: new SlashCommandBuilder()
+    .setName('ban')
+    .setDescription('Banea permanentemente a un usuario del servidor')
+    .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers)
+    .addUserOption((opt) =>
+      opt.setName('usuario').setDescription('Usuario a banear').setRequired(true)
+    )
+    .addStringOption((opt) =>
+      opt.setName('razon').setDescription('Razón del ban').setRequired(true).setMaxLength(512)
+    )
+    .addIntegerOption((opt) =>
+      opt.setName('mensajes').setDescription('Días de mensajes a eliminar (0-7)').setMinValue(0).setMaxValue(7)
+    )
+    .addStringOption((opt) =>
+      opt.setName('evidencia').setDescription('URL de evidencia').setRequired(false)
+    ),
+
+  category: 'moderation',
+  permissions: [PermissionFlagsBits.BanMembers],
+  botPermissions: [PermissionFlagsBits.BanMembers],
+  guildOnly: true,
+
+  async execute(interaction) {
+    const target = interaction.options.getUser('usuario', true);
+    const reason = interaction.options.getString('razon', true);
+    const deleteMessages = interaction.options.getInteger('mensajes') ?? 0;
+    const evidence = interaction.options.getString('evidencia');
+
+    if (!interaction.guild) return;
+
+    // No se puede banear a uno mismo
+    if (target.id === interaction.user.id) {
+      await interaction.reply({
+        embeds: [new EmbedBuilder().setColor(Colors.ERROR).setDescription('❌ No puedes banearte a ti mismo.')],
+        ephemeral: true,
+      });
+      return;
+    }
+
+    // No banear al bot
+    if (target.id === interaction.client.user?.id) {
+      await interaction.reply({
+        embeds: [new EmbedBuilder().setColor(Colors.ERROR).setDescription('❌ No me puedes banear.')],
+        ephemeral: true,
+      });
+      return;
+    }
+
+    // Confirmación
+    const confirmEmbed = new EmbedBuilder()
+      .setColor(Colors.WARNING)
+      .setTitle('🔨 Confirmar Ban')
+      .setThumbnail(target.displayAvatarURL())
+      .addFields(
+        { name: '👤 Usuario', value: `${target.tag} (${userMention(target.id)})`, inline: true },
+        { name: '📝 Razón', value: reason },
+        { name: '🗑️ Mensajes a borrar', value: `${deleteMessages} días`, inline: true },
+      )
+      .setFooter({ text: 'Esta acción es irreversible sin usar /unban' })
+      .setTimestamp();
+
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId('ban_confirm').setLabel('✅ Confirmar').setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId('ban_cancel').setLabel('❌ Cancelar').setStyle(ButtonStyle.Secondary)
+    );
+
+    const reply = await interaction.reply({
+      embeds: [confirmEmbed],
+      components: [row],
+      ephemeral: true,
+    });
+
+    const collector = reply.createMessageComponentCollector({
+      componentType: ComponentType.Button,
+      time: 30_000,
+      filter: (i) => i.user.id === interaction.user.id,
+    });
+
+    collector.on('collect', async (btnInteraction) => {
+      collector.stop();
+
+      if (btnInteraction.customId === 'ban_cancel') {
+        await btnInteraction.update({
+          embeds: [new EmbedBuilder().setColor(Colors.MUTED).setDescription('❌ Ban cancelado.')],
+          components: [],
+        });
+        return;
+      }
+
+      await btnInteraction.update({
+        embeds: [new EmbedBuilder().setColor(Colors.INFO).setDescription('⏳ Ejecutando ban...')],
+        components: [],
+      });
+
+      const result = await ModerationService.ban(interaction.guild!, {
+        guildId: interaction.guild!.id,
+        targetId: target.id,
+        moderatorId: interaction.user.id,
+        action: 'BAN',
+        reason,
+        deleteMessages,
+        evidence: evidence ? [evidence] : [],
+      });
+
+      if (!result.success) {
+        await btnInteraction.editReply({
+          embeds: [new EmbedBuilder().setColor(Colors.ERROR).setDescription(`❌ ${result.error}`)],
+        });
+        return;
+      }
+
+      const successEmbed = new EmbedBuilder()
+        .setColor(Colors.SUCCESS)
+        .setTitle('🔨 Usuario Baneado')
+        .addFields(
+          { name: '👤 Usuario', value: `${target.tag} (${userMention(target.id)})`, inline: true },
+          { name: '📝 Razón', value: reason },
+          { name: '🆔 Caso', value: `#${result.caseNumber}`, inline: true },
+        )
+        .setTimestamp();
+
+      await btnInteraction.editReply({ embeds: [successEmbed] });
+    });
+
+    collector.on('end', async (_, reason) => {
+      if (reason === 'time') {
+        await interaction.editReply({
+          embeds: [new EmbedBuilder().setColor(Colors.MUTED).setDescription('⏱️ Tiempo de confirmación agotado.')],
+          components: [],
+        }).catch(() => null);
+      }
+    });
+  },
+};
+
+export default command;
+
+/**
+ * GUARDIAN BOT - Log Service
+ * Registro de acciones en canales de log con embeds profesionales
+ */
+
+import {
+  Guild,
+  EmbedBuilder,
+  TextChannel,
+  AuditLogEvent,
+  User,
+  GuildMember,
+  Message,
+  GuildChannel,
+  Role,
+  time,
+  TimestampStyles,
+  userMention,
+  channelMention,
+  roleMention,
+} from 'discord.js';
+import { prisma } from '../database/client';
+import { cacheWithFallback, CacheKeys } from '../database/redis';
+import { Colors, type ModerationOptions } from '../types';
+import { formatDuration } from '../utils/duration';
+import { logger } from '../utils/logger';
+
+export class LogService {
+
+  // ================================
+  // GET LOG CHANNEL
+  // ================================
+
+  private async getLogChannel(
+    guild: Guild,
+    type: 'moderation' | 'message' | 'member' | 'channel' | 'role' | 'server' | 'ticket'
+  ): Promise<TextChannel | null> {
+    const config = await cacheWithFallback(
+      CacheKeys.logConfig(guild.id),
+      () => prisma.logConfig.findUnique({ where: { guildId: guild.id } }),
+      300
+    );
+
+    if (!config?.enabled) return null;
+
+    const channelId = config[`${type}Channel` as keyof typeof config] as string | null;
+    if (!channelId) return null;
+
+    const channel = guild.channels.cache.get(channelId);
+    if (!channel?.isTextBased()) return null;
+
+    return channel as TextChannel;
+  }
+
+  private async send(channel: TextChannel | null, embed: EmbedBuilder): Promise<void> {
+    if (!channel) return;
+    try {
+      await channel.send({ embeds: [embed] });
+    } catch (error) {
+      logger.error('[LogService] Error enviando log:', error);
+    }
+  }
+
+  // ================================
+  // LOG MODERATION
+  // ================================
+
+  async logModeration(
+    guild: Guild,
+    options: ModerationOptions & { caseNumber?: number; metadata?: Record<string, unknown> }
+  ): Promise<void> {
+    const channel = await this.getLogChannel(guild, 'moderation');
+    if (!channel) return;
+
+    const actionIcons: Record<string, string> = {
+      BAN: '🔨', TEMPBAN: '⏳🔨', UNBAN: '✅', KICK: '👢',
+      MUTE: '🔇', TEMPMUTE: '⏳🔇', UNMUTE: '🔊',
+      TIMEOUT: '⏰', UNTIMEOUT: '✅⏰', WARN: '⚠️',
+      REMOVEWARN: '✅⚠️', NOTE: '📝',
+    };
+
+    const actionColors: Record<string, number> = {
+      BAN: Colors.ERROR, TEMPBAN: Colors.ERROR, UNBAN: Colors.SUCCESS,
+      KICK: Colors.WARNING, MUTE: Colors.WARNING, TEMPMUTE: Colors.WARNING,
+      UNMUTE: Colors.SUCCESS, TIMEOUT: Colors.WARNING, UNTIMEOUT: Colors.SUCCESS,
+      WARN: Colors.MOD, REMOVEWARN: Colors.SUCCESS, NOTE: Colors.INFO,
+    };
+
+    const icon = actionIcons[options.action] ?? '⚙️';
+    const color = actionColors[options.action] ?? Colors.MUTED;
+
+    const embed = new EmbedBuilder()
+      .setColor(color)
+      .setTitle(`${icon} ${options.action}${options.caseNumber ? ` | Caso #${options.caseNumber}` : ''}`)
+      .addFields(
+        { name: '👤 Usuario', value: userMention(options.targetId), inline: true },
+        { name: '🛡️ Moderador', value: userMention(options.moderatorId), inline: true },
+        { name: '📝 Razón', value: options.reason },
+      )
+      .setTimestamp();
+
+    if (options.duration) {
+      embed.addFields({ name: '⏱️ Duración', value: formatDuration(options.duration), inline: true });
+    }
+
+    if (options.evidence?.length) {
+      embed.addFields({ name: '🔗 Evidencias', value: options.evidence.join('\n') });
+    }
+
+    if (options.caseNumber) {
+      embed.setFooter({ text: `ID de caso: ${options.caseNumber}` });
+    }
+
+    await this.send(channel, embed);
+  }
+
+  // ================================
+  // LOG MESSAGE DELETE
+  // ================================
+
+  async logMessageDelete(guild: Guild, message: Message): Promise<void> {
+    const channel = await this.getLogChannel(guild, 'message');
+    if (!channel) return;
+
+    const embed = new EmbedBuilder()
+      .setColor(Colors.ERROR)
+      .setTitle('🗑️ Mensaje Eliminado')
+      .addFields(
+        { name: '👤 Autor', value: message.author ? userMention(message.author.id) : 'Desconocido', inline: true },
+        { name: '📍 Canal', value: channelMention(message.channelId), inline: true },
+      )
+      .setTimestamp();
+
+    if (message.content) {
+      embed.addFields({
+        name: '💬 Contenido',
+        value: message.content.slice(0, 1024) || '*(sin texto)*',
+      });
+    }
+
+    if (message.attachments.size > 0) {
+      embed.addFields({
+        name: '📎 Archivos',
+        value: message.attachments.map((a) => a.url).join('\n'),
+      });
+    }
+
+    await this.send(channel, embed);
+  }
+
+  // ================================
+  // LOG MESSAGE EDIT
+  // ================================
+
+  async logMessageEdit(guild: Guild, oldMessage: Message, newMessage: Message): Promise<void> {
+    if (oldMessage.content === newMessage.content) return;
+
+    const channel = await this.getLogChannel(guild, 'message');
+    if (!channel) return;
+
+    const embed = new EmbedBuilder()
+      .setColor(Colors.WARNING)
+      .setTitle('✏️ Mensaje Editado')
+      .setURL(newMessage.url)
+      .addFields(
+        { name: '👤 Autor', value: newMessage.author ? userMention(newMessage.author.id) : 'Desconocido', inline: true },
+        { name: '📍 Canal', value: channelMention(newMessage.channelId), inline: true },
+        { name: '📝 Antes', value: oldMessage.content?.slice(0, 512) || '*(vacío)*' },
+        { name: '📝 Después', value: newMessage.content?.slice(0, 512) || '*(vacío)*' },
+      )
+      .setTimestamp();
+
+    await this.send(channel, embed);
+  }
+
+  // ================================
+  // LOG MEMBER JOIN
+  // ================================
+
+  async logMemberJoin(guild: Guild, member: GuildMember): Promise<void> {
+    const channel = await this.getLogChannel(guild, 'member');
+    if (!channel) return;
+
+    const accountAge = Date.now() - member.user.createdTimestamp;
+    const isNew = accountAge < 7 * 24 * 60 * 60 * 1000; // < 7 días
+
+    const embed = new EmbedBuilder()
+      .setColor(Colors.SUCCESS)
+      .setTitle('📥 Miembro Entró')
+      .setThumbnail(member.user.displayAvatarURL())
+      .addFields(
+        { name: '👤 Usuario', value: `${member.user.tag} (${userMention(member.id)})`, inline: true },
+        { name: '🆔 ID', value: member.id, inline: true },
+        { name: '📅 Cuenta creada', value: time(member.user.createdAt, TimestampStyles.RelativeTime), inline: true },
+        { name: '👥 Miembros totales', value: guild.memberCount.toString(), inline: true },
+      )
+      .setTimestamp();
+
+    if (isNew) {
+      embed.addFields({ name: '⚠️ Cuenta nueva', value: 'Esta cuenta tiene menos de 7 días de antigüedad.' });
+      embed.setColor(Colors.WARNING);
+    }
+
+    await this.send(channel, embed);
+  }
+
+  // ================================
+  // LOG MEMBER LEAVE
+  // ================================
+
+  async logMemberLeave(guild: Guild, member: GuildMember): Promise<void> {
+    const channel = await this.getLogChannel(guild, 'member');
+    if (!channel) return;
+
+    const joinDate = member.joinedAt ? time(member.joinedAt, TimestampStyles.RelativeTime) : 'Desconocido';
+
+    const embed = new EmbedBuilder()
+      .setColor(Colors.ERROR)
+      .setTitle('📤 Miembro Salió')
+      .setThumbnail(member.user.displayAvatarURL())
+      .addFields(
+        { name: '👤 Usuario', value: `${member.user.tag} (${userMention(member.id)})`, inline: true },
+        { name: '🆔 ID', value: member.id, inline: true },
+        { name: '📅 Se unió', value: joinDate, inline: true },
+        { name: '🏷️ Roles', value: member.roles.cache.filter((r) => r.id !== guild.id).map((r) => r.name).join(', ') || 'Ninguno' },
+      )
+      .setTimestamp();
+
+    await this.send(channel, embed);
+  }
+
+  // ================================
+  // LOG CHANNEL CREATE/DELETE
+  // ================================
+
+  async logChannelCreate(guild: Guild, channel: GuildChannel): Promise<void> {
+    const logChannel = await this.getLogChannel(guild, 'channel');
+    if (!logChannel) return;
+
+    const embed = new EmbedBuilder()
+      .setColor(Colors.SUCCESS)
+      .setTitle('➕ Canal Creado')
+      .addFields(
+        { name: '📍 Canal', value: `${channel.name} (${channelMention(channel.id)})`, inline: true },
+        { name: '📂 Tipo', value: channel.type.toString(), inline: true },
+      )
+      .setTimestamp();
+
+    await this.send(logChannel, embed);
+  }
+
+  async logChannelDelete(guild: Guild, channel: GuildChannel): Promise<void> {
+    const logChannel = await this.getLogChannel(guild, 'channel');
+    if (!logChannel) return;
+
+    const embed = new EmbedBuilder()
+      .setColor(Colors.ERROR)
+      .setTitle('❌ Canal Eliminado')
+      .addFields(
+        { name: '📍 Canal', value: channel.name, inline: true },
+        { name: '🆔 ID', value: channel.id, inline: true },
+      )
+      .setTimestamp();
+
+    await this.send(logChannel, embed);
+  }
+}
+
+/**
+ * GUARDIAN BOT - Duration Utility
+ * Parseo y formateo de duraciones de tiempo
+ */
+
+export interface ParsedDuration {
+  seconds: number;
+  formatted: string;
+}
+
+const UNITS: Record<string, number> = {
+  s: 1,
+  seg: 1,
+  m: 60,
+  min: 60,
+  h: 3600,
+  hr: 3600,
+  d: 86400,
+  dia: 86400,
+  día: 86400,
+  dias: 86400,
+  días: 86400,
+  w: 604800,
+  sem: 604800,
+  semana: 604800,
+  semanas: 604800,
+};
+
+/**
+ * Parsea strings de duración como "1h", "30m", "7d", "2w"
+ */
+export function parseDuration(input: string): ParsedDuration | null {
+  const matches = input.toLowerCase().match(/(\d+)\s*(s|seg|m|min|h|hr|d|dia|día|dias|días|w|sem|semana|semanas)/g);
+
+  if (!matches) {
+    // Intentar parsear como número puro (segundos)
+    const num = parseInt(input);
+    if (!isNaN(num) && num > 0) {
+      return { seconds: num, formatted: formatDuration(num) };
+    }
+    return null;
+  }
+
+  let total = 0;
+  for (const match of matches) {
+    const numMatch = match.match(/(\d+)/);
+    const unitMatch = match.match(/[a-záíóúñ]+/i);
+    if (!numMatch || !unitMatch) continue;
+
+    const num = parseInt(numMatch[1] ?? '0');
+    const unit = unitMatch[0];
+    const multiplier = UNITS[unit ?? ''] ?? 0;
+    total += num * multiplier;
+  }
+
+  if (total <= 0) return null;
+
+  return { seconds: total, formatted: formatDuration(total) };
+}
+
+/**
+ * Formatea segundos en texto legible
+ */
+export function formatDuration(seconds: number): string {
+  if (seconds < 60) return `${seconds} segundo${seconds !== 1 ? 's' : ''}`;
+
+  const parts: string[] = [];
+
+  const weeks = Math.floor(seconds / 604800);
+  if (weeks > 0) {
+    parts.push(`${weeks} semana${weeks !== 1 ? 's' : ''}`);
+    seconds %= 604800;
+  }
+
+  const days = Math.floor(seconds / 86400);
+  if (days > 0) {
+    parts.push(`${days} día${days !== 1 ? 's' : ''}`);
+    seconds %= 86400;
+  }
+
+  const hours = Math.floor(seconds / 3600);
+  if (hours > 0) {
+    parts.push(`${hours} hora${hours !== 1 ? 's' : ''}`);
+    seconds %= 3600;
+  }
+
+  const minutes = Math.floor(seconds / 60);
+  if (minutes > 0) {
+    parts.push(`${minutes} minuto${minutes !== 1 ? 's' : ''}`);
+    seconds %= 60;
+  }
+
+  if (seconds > 0) {
+    parts.push(`${seconds} segundo${seconds !== 1 ? 's' : ''}`);
+  }
+
+  return parts.join(', ');
+}
+
+/**
+ * Valida que la duración esté dentro de límites
+ */
+export function validateDuration(seconds: number, max: number = 2419200): string | null {
+  if (seconds <= 0) return 'La duración debe ser positiva.';
+  if (seconds > max) return `La duración máxima es ${formatDuration(max)}.`;
+  return null;
+}
+
+/**
+ * GUARDIAN BOT - Moderation Service
+ * Lógica central de moderación: ban, kick, mute, timeout, warn, etc.
+ */
+
+import {
+  Guild,
+  GuildMember,
+  EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  TextChannel,
+  time,
+  TimestampStyles,
+} from 'discord.js';
+import { prisma } from '../database/client';
+import { redis, CacheKeys, cacheDel } from '../database/redis';
+import { LogService } from './logService';
+import { Colors, type ModerationOptions, type ModerationResult } from '../types';
+import { parseDuration, formatDuration } from '../utils/duration';
+import { logger } from '../utils/logger';
+
+export class ModerationService {
+  private static logService = new LogService();
+
+  // ================================
+  // BAN
+  // ================================
+
+  static async ban(
+    guild: Guild,
+    options: ModerationOptions & { deleteMessages?: number }
+  ): Promise<ModerationResult> {
+    try {
+      const target = await guild.members.fetch(options.targetId).catch(() => null);
+
+      if (target && !target.bannable) {
+        return { success: false, error: 'No puedo banear a este usuario (permisos superiores).' };
+      }
+
+      await guild.members.ban(options.targetId, {
+        reason: `[${options.moderatorId}] ${options.reason}`,
+        deleteMessageSeconds: (options.deleteMessages ?? 0) * 86400,
+      });
+
+      const result = await this.createCase(guild.id, options);
+      await this.notifyUser(guild, options.targetId, 'ban', options.reason, options.duration);
+      await this.logService.logModeration(guild, { ...options, caseNumber: result.caseNumber });
+
+      return result;
+    } catch (error) {
+      logger.error('[Moderation] Error en ban:', error);
+      return { success: false, error: 'Error al ejecutar el ban.' };
+    }
+  }
+
+  // ================================
+  // TEMPBAN
+  // ================================
+
+  static async tempban(
+    guild: Guild,
+    options: ModerationOptions
+  ): Promise<ModerationResult> {
+    if (!options.duration) return { success: false, error: 'Duración requerida para tempban.' };
+
+    const result = await this.ban(guild, options);
+
+    if (result.success && options.duration) {
+      // Programar unban
+      const key = `tempban:${guild.id}:${options.targetId}`;
+      await redis.setex(key, options.duration, JSON.stringify({
+        guildId: guild.id,
+        userId: options.targetId,
+        moderatorId: options.moderatorId,
+        reason: `Tempban expirado. Razón original: ${options.reason}`,
+      }));
+    }
+
+    return result;
+  }
+
+  // ================================
+  // UNBAN
+  // ================================
+
+  static async unban(
+    guild: Guild,
+    options: ModerationOptions
+  ): Promise<ModerationResult> {
+    try {
+      const ban = await guild.bans.fetch(options.targetId).catch(() => null);
+      if (!ban) return { success: false, error: 'Este usuario no está baneado.' };
+
+      await guild.members.unban(options.targetId, `[${options.moderatorId}] ${options.reason}`);
+
+      const result = await this.createCase(guild.id, options);
+      await this.logService.logModeration(guild, { ...options, caseNumber: result.caseNumber });
+
+      // Actualizar sanción activa
+      await prisma.moderation.updateMany({
+        where: {
+          guildId: guild.id,
+          targetId: options.targetId,
+          type: { in: ['BAN', 'TEMPBAN'] },
+          status: 'ACTIVE',
+        },
+        data: { status: 'REVOKED' },
+      });
+
+      return result;
+    } catch (error) {
+      logger.error('[Moderation] Error en unban:', error);
+      return { success: false, error: 'Error al ejecutar el unban.' };
+    }
+  }
+
+  // ================================
+  // KICK
+  // ================================
+
+  static async kick(
+    guild: Guild,
+    options: ModerationOptions
+  ): Promise<ModerationResult> {
+    try {
+      const member = await guild.members.fetch(options.targetId).catch(() => null);
+      if (!member) return { success: false, error: 'Usuario no encontrado en el servidor.' };
+      if (!member.kickable) return { success: false, error: 'No puedo expulsar a este usuario.' };
+
+      await this.notifyUser(guild, options.targetId, 'kick', options.reason);
+      await member.kick(`[${options.moderatorId}] ${options.reason}`);
+
+      const result = await this.createCase(guild.id, options);
+      await this.logService.logModeration(guild, { ...options, caseNumber: result.caseNumber });
+
+      return result;
+    } catch (error) {
+      logger.error('[Moderation] Error en kick:', error);
+      return { success: false, error: 'Error al ejecutar el kick.' };
+    }
+  }
+
+  // ================================
+  // TIMEOUT
+  // ================================
+
+  static async timeout(
+    guild: Guild,
+    options: ModerationOptions
+  ): Promise<ModerationResult> {
+    try {
+      if (!options.duration) return { success: false, error: 'Duración requerida para timeout.' };
+      if (options.duration > 2419200) return { success: false, error: 'El timeout no puede ser mayor a 28 días.' };
+
+      const member = await guild.members.fetch(options.targetId).catch(() => null);
+      if (!member) return { success: false, error: 'Usuario no encontrado.' };
+      if (!member.moderatable) return { success: false, error: 'No puedo silenciar a este usuario.' };
+
+      await member.timeout(options.duration * 1000, `[${options.moderatorId}] ${options.reason}`);
+      await this.notifyUser(guild, options.targetId, 'timeout', options.reason, options.duration);
+
+      const result = await this.createCase(guild.id, options);
+      await this.logService.logModeration(guild, { ...options, caseNumber: result.caseNumber });
+
+      return result;
+    } catch (error) {
+      logger.error('[Moderation] Error en timeout:', error);
+      return { success: false, error: 'Error al aplicar timeout.' };
+    }
+  }
+
+  // ================================
+  // REMOVE TIMEOUT
+  // ================================
+
+  static async untimeout(
+    guild: Guild,
+    options: ModerationOptions
+  ): Promise<ModerationResult> {
+    try {
+      const member = await guild.members.fetch(options.targetId).catch(() => null);
+      if (!member) return { success: false, error: 'Usuario no encontrado.' };
+
+      await member.timeout(null, `[${options.moderatorId}] ${options.reason}`);
+
+      const result = await this.createCase(guild.id, options);
+      await this.logService.logModeration(guild, { ...options, caseNumber: result.caseNumber });
+
+      return result;
+    } catch (error) {
+      logger.error('[Moderation] Error en untimeout:', error);
+      return { success: false, error: 'Error al remover timeout.' };
+    }
+  }
+
+  // ================================
+  // WARN
+  // ================================
+
+  static async warn(
+    guild: Guild,
+    options: ModerationOptions & { points?: number }
+  ): Promise<ModerationResult> {
+    try {
+      const member = await guild.members.fetch(options.targetId).catch(() => null);
+      if (!member) return { success: false, error: 'Usuario no encontrado.' };
+
+      await prisma.warning.create({
+        data: {
+          guildId: guild.id,
+          userId: options.targetId,
+          moderatorId: options.moderatorId,
+          reason: options.reason,
+          points: options.points ?? 1,
+        },
+      });
+
+      // Invalidar caché de advertencias
+      await cacheDel(CacheKeys.userWarnings(guild.id, options.targetId));
+
+      // Contar advertencias activas
+      const totalWarnings = await prisma.warning.count({
+        where: { guildId: guild.id, userId: options.targetId, active: true },
+      });
+
+      await this.notifyUser(guild, options.targetId, 'warn', options.reason);
+
+      const result = await this.createCase(guild.id, options);
+      await this.logService.logModeration(guild, {
+        ...options,
+        caseNumber: result.caseNumber,
+        metadata: { totalWarnings },
+      });
+
+      // Acciones automáticas por acumulación de warns
+      await this.checkAutoAction(guild, options.targetId, totalWarnings, options.moderatorId);
+
+      return { ...result, metadata: { totalWarnings } } as ModerationResult & { metadata: { totalWarnings: number } };
+    } catch (error) {
+      logger.error('[Moderation] Error en warn:', error);
+      return { success: false, error: 'Error al aplicar advertencia.' };
+    }
+  }
+
+  // ================================
+  // PRIVATE HELPERS
+  // ================================
+
+  /**
+   * Crea un caso de moderación en la base de datos
+   */
+  private static async createCase(
+    guildId: string,
+    options: ModerationOptions
+  ): Promise<ModerationResult> {
+    try {
+      // Asegurar que el guild existe en BD
+      await prisma.guild.upsert({
+        where: { id: guildId },
+        update: {},
+        create: { id: guildId, name: 'Unknown', ownerId: 'Unknown' },
+      });
+
+      // Asegurar usuarios en BD
+      await prisma.user.upsert({
+        where: { id: options.targetId },
+        update: {},
+        create: { id: options.targetId, username: 'Unknown' },
+      });
+      await prisma.user.upsert({
+        where: { id: options.moderatorId },
+        update: {},
+        create: { id: options.moderatorId, username: 'Unknown' },
+      });
+
+      // Número de caso (secuencial por guild)
+      const lastCase = await prisma.moderationCase.findFirst({
+        where: { guildId },
+        orderBy: { caseNumber: 'desc' },
+      });
+      const caseNumber = (lastCase?.caseNumber ?? 0) + 1;
+
+      const expiresAt = options.duration
+        ? new Date(Date.now() + options.duration * 1000)
+        : undefined;
+
+      const moderation = await prisma.moderation.create({
+        data: {
+          guildId,
+          targetId: options.targetId,
+          moderatorId: options.moderatorId,
+          type: options.action as any,
+          reason: options.reason,
+          duration: options.duration,
+          expiresAt,
+          evidence: options.evidence ?? [],
+          metadata: options.metadata as any,
+        },
+      });
+
+      const caseRecord = await prisma.moderationCase.create({
+        data: {
+          caseNumber,
+          guildId,
+          moderationId: moderation.id,
+          targetId: options.targetId,
+          moderatorId: options.moderatorId,
+          type: options.action as any,
+          reason: options.reason,
+          evidence: options.evidence ?? [],
+        },
+      });
+
+      return { success: true, caseId: caseRecord.id, caseNumber };
+    } catch (error) {
+      logger.error('[Moderation] Error creando caso:', error);
+      return { success: false, error: 'Error al crear el caso.' };
+    }
+  }
+
+  /**
+   * Notifica al usuario por DM sobre la sanción
+   */
+  private static async notifyUser(
+    guild: Guild,
+    userId: string,
+    action: string,
+    reason: string,
+    duration?: number
+  ): Promise<void> {
+    try {
+      const user = await guild.client.users.fetch(userId).catch(() => null);
+      if (!user) return;
+
+      const actionNames: Record<string, string> = {
+        ban: '🔨 Has sido baneado',
+        kick: '👢 Has sido expulsado',
+        mute: '🔇 Has sido silenciado',
+        timeout: '⏰ Has recibido un timeout',
+        warn: '⚠️ Has recibido una advertencia',
+      };
+
+      const embed = new EmbedBuilder()
+        .setColor(Colors.ERROR)
+        .setTitle(`${actionNames[action] ?? '⚠️ Sanción'} en **${guild.name}**`)
+        .addFields({ name: 'Razón', value: reason })
+        .setTimestamp();
+
+      if (duration) {
+        embed.addFields({
+          name: 'Duración',
+          value: formatDuration(duration),
+        });
+      }
+
+      embed.addFields({
+        name: '¿Injusto?',
+        value: 'Puedes apelar esta sanción si crees que es incorrecta.',
+      });
+
+      await user.send({ embeds: [embed] }).catch(() => null);
+    } catch {
+      // Ignorar si no se puede enviar DM
+    }
+  }
+
+  /**
+   * Acciones automáticas basadas en número de advertencias
+   */
+  private static async checkAutoAction(
+    guild: Guild,
+    targetId: string,
+    totalWarnings: number,
+    moderatorId: string
+  ): Promise<void> {
+    // Ejemplo: 3 warns = timeout, 5 warns = kick, 7 warns = ban
+    // Esto debería ser configurable por guild
+    const thresholds = [
+      { at: 3, action: 'TIMEOUT', duration: 3600 },
+      { at: 5, action: 'KICK', duration: undefined },
+      { at: 7, action: 'BAN', duration: undefined },
+    ];
+
+    const threshold = thresholds.find((t) => t.at === totalWarnings);
+    if (!threshold) return;
+
+    logger.info(`[AutoAction] ${totalWarnings} warns → ${threshold.action} para ${targetId} en ${guild.id}`);
+
+    switch (threshold.action) {
+      case 'TIMEOUT':
+        await this.timeout(guild, {
+          guildId: guild.id,
+          targetId,
+          moderatorId,
+          action: 'TIMEOUT',
+          reason: `Acción automática: ${totalWarnings} advertencias acumuladas`,
+          duration: threshold.duration,
+        });
+        break;
+      case 'KICK':
+        await this.kick(guild, {
+          guildId: guild.id,
+          targetId,
+          moderatorId,
+          action: 'KICK',
+          reason: `Acción automática: ${totalWarnings} advertencias acumuladas`,
+        });
+        break;
+      case 'BAN':
+        await this.ban(guild, {
+          guildId: guild.id,
+          targetId,
+          moderatorId,
+          action: 'BAN',
+          reason: `Acción automática: ${totalWarnings} advertencias acumuladas`,
+        });
+        break;
+    }
+  }
+}
+
+/**
+ * GUARDIAN BOT - ready Event
+ */
+
+import { ActivityType } from 'discord.js';
+import { logger } from '../utils/logger';
+import type { GuardianClient } from '../bot';
+import type { Event } from '../types';
+
+const event: Event = {
+  name: 'ready',
+  once: true,
+  async execute(client: unknown) {
+    const bot = client as GuardianClient;
+
+    logger.info(`✅ Guardian Bot listo como: ${bot.user?.tag}`);
+    logger.info(`📊 Servidores: ${bot.guilds.cache.size}`);
+    logger.info(`👥 Usuarios: ${bot.users.cache.size}`);
+
+    // Actividad del bot
+    const statuses = [
+      { name: `${bot.guilds.cache.size} servidores`, type: ActivityType.Watching },
+      { name: '/help | Guardian Bot', type: ActivityType.Playing },
+      { name: 'la comunidad', type: ActivityType.Watching },
+    ];
+
+    let idx = 0;
+    const setStatus = () => {
+      const status = statuses[idx % statuses.length];
+      if (status && bot.user) {
+        bot.user.setActivity(status.name, { type: status.type });
+      }
+      idx++;
+    };
+
+    setStatus();
+    setInterval(setStatus, 60_000); // Cambia cada minuto
+  },
+};
+
+export default event;
+
+/**
+ * GUARDIAN BOT - interactionCreate Event
+ * Manejo central de todas las interacciones
+ */
+
+import {
+  ChatInputCommandInteraction,
+  AutocompleteInteraction,
+  ButtonInteraction,
+  StringSelectMenuInteraction,
+  ModalSubmitInteraction,
+  PermissionsBitField,
+  EmbedBuilder,
+} from 'discord.js';
+import { logger } from '../utils/logger';
+import { Colors } from '../types';
+import { redis } from '../database/redis';
+import { handleButton } from '../handlers/buttonHandler';
+import { handleSelect } from '../handlers/selectHandler';
+import { handleModal } from '../handlers/modalHandler';
+import type { GuardianClient } from '../bot';
+import type { Event } from '../types';
+
+const RATE_LIMIT_WINDOW = parseInt(process.env['RATE_LIMIT_WINDOW'] ?? '60000') / 1000;
+const RATE_LIMIT_MAX = parseInt(process.env['RATE_LIMIT_MAX'] ?? '30');
+
+const event: Event = {
+  name: 'interactionCreate',
+  async execute(interaction: unknown) {
+    const client = (interaction as ChatInputCommandInteraction).client as GuardianClient;
+
+    // ---- Slash Commands ----
+    if ((interaction as ChatInputCommandInteraction).isChatInputCommand()) {
+      await handleSlashCommand(interaction as ChatInputCommandInteraction, client);
+      return;
+    }
+
+    // ---- Autocomplete ----
+    if ((interaction as AutocompleteInteraction).isAutocomplete()) {
+      await handleAutocomplete(interaction as AutocompleteInteraction, client);
+      return;
+    }
+
+    // ---- Botones ----
+    if ((interaction as ButtonInteraction).isButton()) {
+      await handleButton(interaction as ButtonInteraction, client);
+      return;
+    }
+
+    // ---- Select Menus ----
+    if ((interaction as StringSelectMenuInteraction).isStringSelectMenu()) {
+      await handleSelect(interaction as StringSelectMenuInteraction, client);
+      return;
+    }
+
+    // ---- Modals ----
+    if ((interaction as ModalSubmitInteraction).isModalSubmit()) {
+      await handleModal(interaction as ModalSubmitInteraction, client);
+      return;
+    }
+  },
+};
+
+// ================================
+// SLASH COMMANDS
+// ================================
+
+async function handleSlashCommand(
+  interaction: ChatInputCommandInteraction,
+  client: GuardianClient
+): Promise<void> {
+  const command = client.commands.get(interaction.commandName);
+
+  if (!command) {
+    await interaction.reply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(Colors.ERROR)
+          .setDescription('❌ Comando no encontrado.')
+      ],
+      ephemeral: true,
+    });
+    return;
+  }
+
+  // Solo en servidores
+  if (command.guildOnly && !interaction.guildId) {
+    await interaction.reply({
+      embeds: [new EmbedBuilder().setColor(Colors.ERROR).setDescription('❌ Solo disponible en servidores.')],
+      ephemeral: true,
+    });
+    return;
+  }
+
+  // Rate limiting por usuario
+  const rateLimitKey = `rl:${interaction.user.id}`;
+  const requests = await redis.incr(rateLimitKey);
+  if (requests === 1) await redis.expire(rateLimitKey, RATE_LIMIT_WINDOW);
+
+  if (requests > RATE_LIMIT_MAX) {
+    await interaction.reply({
+      embeds: [new EmbedBuilder().setColor(Colors.WARNING).setDescription('⏱️ Demasiados comandos. Espera un momento.')],
+      ephemeral: true,
+    });
+    return;
+  }
+
+  // Cooldown por comando
+  if (command.cooldown) {
+    const cooldownKey = `cooldown:${interaction.user.id}:${command.data.name}`;
+    const lastUsed = await redis.get(cooldownKey);
+
+    if (lastUsed) {
+      const remaining = command.cooldown - (Date.now() - parseInt(lastUsed)) / 1000;
+      if (remaining > 0) {
+        await interaction.reply({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(Colors.WARNING)
+              .setDescription(`⏱️ Espera **${remaining.toFixed(1)}s** para usar este comando de nuevo.`)
+          ],
+          ephemeral: true,
+        });
+        return;
+      }
+    }
+
+    await redis.setex(cooldownKey, command.cooldown, Date.now().toString());
+  }
+
+  // Permisos del usuario
+  if (command.permissions && interaction.memberPermissions) {
+    const missing = (interaction.memberPermissions as PermissionsBitField).missing(command.permissions);
+    if (missing.length > 0) {
+      await interaction.reply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(Colors.ERROR)
+            .setDescription(`❌ No tienes los permisos necesarios: \`${missing.join(', ')}\``)
+        ],
+        ephemeral: true,
+      });
+      return;
+    }
+  }
+
+  // Permisos del bot
+  if (command.botPermissions && interaction.guild?.members.me?.permissions) {
+    const missing = interaction.guild.members.me.permissions.missing(command.botPermissions);
+    if (missing.length > 0) {
+      await interaction.reply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(Colors.ERROR)
+            .setDescription(`❌ Me faltan permisos: \`${missing.join(', ')}\``)
+        ],
+        ephemeral: true,
+      });
+      return;
+    }
+  }
+
+  // Ejecutar comando
+  try {
+    logger.info(`[CMD] /${command.data.name} por ${interaction.user.tag} en ${interaction.guildId}`);
+    await command.execute(interaction, client);
+  } catch (error) {
+    logger.error(`[CMD] Error en /${command.data.name}:`, error);
+
+    const errorEmbed = new EmbedBuilder()
+      .setColor(Colors.ERROR)
+      .setTitle('❌ Error interno')
+      .setDescription('Ocurrió un error al ejecutar este comando. Ha sido reportado automáticamente.')
+      .setTimestamp();
+
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply({ embeds: [errorEmbed] });
+    } else {
+      await interaction.reply({ embeds: [errorEmbed], ephemeral: true });
+    }
+  }
+}
+
+// ================================
+// AUTOCOMPLETE
+// ================================
+
+async function handleAutocomplete(
+  interaction: AutocompleteInteraction,
+  client: GuardianClient
+): Promise<void> {
+  const command = client.commands.get(interaction.commandName);
+  if (!command?.autocomplete) return;
+
+  try {
+    await command.autocomplete(interaction, client);
+  } catch (error) {
+    logger.error(`[Autocomplete] Error en ${interaction.commandName}:`, error);
+  }
+}
+
+export default event;
+
+/**
+ * GUARDIAN BOT - Event Handler
+ * Carga automática de todos los eventos
+ */
+
+import { readdirSync } from 'fs';
+import path from 'path';
+import { logger } from '../utils/logger';
+import type { GuardianClient } from '../bot';
+import type { Event } from '../types';
+
+export async function loadEvents(client: GuardianClient): Promise<void> {
+  const eventsPath = path.join(__dirname, '..', 'events');
+
+  try {
+    const files = readdirSync(eventsPath).filter((f) => f.endsWith('.ts') || f.endsWith('.js'));
+
+    for (const file of files) {
+      try {
+        const filePath = path.join(eventsPath, file);
+        const event = (await import(filePath)) as { default: Event };
+
+        if (!event.default?.name || !event.default?.execute) {
+          logger.warn(`[Events] Evento inválido en ${filePath}`);
+          continue;
+        }
+
+        const handler = (...args: unknown[]) => event.default.execute(...args);
+
+        if (event.default.once) {
+          client.once(event.default.name, handler);
+        } else {
+          client.on(event.default.name, handler);
+        }
+
+        logger.debug(`[Events] Registrado: ${event.default.name}`);
+      } catch (error) {
+        logger.error(`[Events] Error cargando ${file}:`, error);
+      }
+    }
+
+    logger.info(`[Events] Total: ${files.length} eventos registrados`);
+  } catch (error) {
+    logger.error('[Events] Error cargando eventos:', error);
+    throw error;
+  }
+}
+
+/**
+ * GUARDIAN BOT - Command Handler
+ * Carga automática de todos los slash commands
+ */
+
+import { readdirSync, statSync } from 'fs';
+import path from 'path';
+import { logger } from '../utils/logger';
+import type { GuardianClient } from '../bot';
+import type { Command } from '../types';
+
+export async function loadCommands(client: GuardianClient): Promise<void> {
+  const commandsPath = path.join(__dirname, '..', 'commands');
+
+  try {
+    const categories = readdirSync(commandsPath).filter((f) =>
+      statSync(path.join(commandsPath, f)).isDirectory()
+    );
+
+    for (const category of categories) {
+      const categoryPath = path.join(commandsPath, category);
+      const files = readdirSync(categoryPath).filter((f) => f.endsWith('.ts') || f.endsWith('.js'));
+
+      for (const file of files) {
+        try {
+          const filePath = path.join(categoryPath, file);
+          const command = (await import(filePath)) as { default: Command };
+
+          if (!command.default?.data || !command.default?.execute) {
+            logger.warn(`[Commands] Comando inválido en ${filePath}`);
+            continue;
+          }
+
+          client.commands.set(command.default.data.name, command.default);
+          logger.debug(`[Commands] Cargado: /${command.default.data.name} [${category}]`);
+        } catch (error) {
+          logger.error(`[Commands] Error cargando ${file}:`, error);
+        }
+      }
+    }
+
+    logger.info(`[Commands] Total: ${client.commands.size} comandos en ${categories.length} categorías`);
+  } catch (error) {
+    logger.error('[Commands] Error cargando comandos:', error);
+    throw error;
+  }
+}
+
+/**
+ * GUARDIAN BOT - Redis Client
+ * Conexión y utilidades de caché
+ */
+
+import { Redis } from 'ioredis';
+import { logger } from '../utils/logger';
+
+// ================================
+// CLIENTE REDIS
+// ================================
+
+export const redis = new Redis(process.env['REDIS_URL'] ?? 'redis://localhost:6379', {
+  password: process.env['REDIS_PASSWORD'] ?? undefined,
+  tls: process.env['REDIS_TLS'] === 'true' ? {} : undefined,
+  maxRetriesPerRequest: 3,
+  retryStrategy: (times) => {
+    if (times > 10) {
+      logger.error('[Redis] No se puede conectar después de 10 intentos');
+      return null;
+    }
+    return Math.min(times * 200, 2000);
+  },
+  enableOfflineQueue: true,
+  lazyConnect: false,
+});
+
+redis.on('connect', () => logger.info('[Redis] Conectado'));
+redis.on('error', (err) => logger.error('[Redis] Error:', err));
+redis.on('reconnecting', () => logger.warn('[Redis] Reconectando...'));
+
+// ================================
+// HELPERS TIPADOS
+// ================================
+
+const DEFAULT_TTL = parseInt(process.env['CACHE_TTL'] ?? '300');
+
+/**
+ * Guardar en caché con TTL automático
+ */
+export async function cacheSet<T>(
+  key: string,
+  value: T,
+  ttl: number = DEFAULT_TTL
+): Promise<void> {
+  await redis.setex(key, ttl, JSON.stringify(value));
+}
+
+/**
+ * Obtener de caché (retorna null si no existe)
+ */
+export async function cacheGet<T>(key: string): Promise<T | null> {
+  const data = await redis.get(key);
+  if (!data) return null;
+  try {
+    return JSON.parse(data) as T;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Eliminar de caché
+ */
+export async function cacheDel(...keys: string[]): Promise<void> {
+  if (keys.length > 0) await redis.del(...keys);
+}
+
+/**
+ * Invalidar claves por patrón
+ */
+export async function cacheInvalidate(pattern: string): Promise<void> {
+  const keys = await redis.keys(pattern);
+  if (keys.length > 0) await redis.del(...keys);
+}
+
+/**
+ * Caché con fallback (cache-aside pattern)
+ */
+export async function cacheWithFallback<T>(
+  key: string,
+  fallback: () => Promise<T>,
+  ttl: number = DEFAULT_TTL
+): Promise<T> {
+  const cached = await cacheGet<T>(key);
+  if (cached !== null) return cached;
+
+  const value = await fallback();
+  await cacheSet(key, value, ttl);
+  return value;
+}
+
+// ================================
+// RATE LIMITING EN REDIS
+// ================================
+
+/**
+ * Incrementa un contador con TTL (para rate limiting)
+ * Retorna el número actual de requests
+ */
+export async function incrementCounter(
+  key: string,
+  window: number // segundos
+): Promise<number> {
+  const pipeline = redis.pipeline();
+  pipeline.incr(key);
+  pipeline.expire(key, window);
+  const results = await pipeline.exec();
+  return (results?.[0]?.[1] as number) ?? 0;
+}
+
+// ================================
+// LLAVE PATTERNS
+// ================================
+
+export const CacheKeys = {
+  guildConfig: (guildId: string) => `config:${guildId}`,
+  automodConfig: (guildId: string) => `automod:${guildId}`,
+  antiRaidConfig: (guildId: string) => `antiraid:${guildId}`,
+  ticketConfig: (guildId: string) => `ticket_config:${guildId}`,
+  logConfig: (guildId: string) => `log_config:${guildId}`,
+  welcomeConfig: (guildId: string) => `welcome:${guildId}`,
+  verificationConfig: (guildId: string) => `verification:${guildId}`,
+  userWarnings: (guildId: string, userId: string) => `warnings:${guildId}:${userId}`,
+  memberSpam: (guildId: string, userId: string) => `spam:${guildId}:${userId}`,
+  memberFlood: (guildId: string, userId: string) => `flood:${guildId}:${userId}`,
+  memberMentions: (guildId: string, userId: string) => `mentions:${guildId}:${userId}`,
+  raidDetection: (guildId: string) => `raid:${guildId}`,
+  commandCooldown: (userId: string, command: string) => `cooldown:${userId}:${command}`,
+} as const;
+
+/**
+ * GUARDIAN BOT - Prisma Client
+ * Singleton del cliente de base de datos
+ */
+
+import { PrismaClient } from '@prisma/client';
+import { logger } from '../utils/logger';
+
+const globalForPrisma = globalThis as unknown as {
+  prisma: PrismaClient | undefined;
+};
+
+export const prisma =
+  globalForPrisma.prisma ??
+  new PrismaClient({
+    log: [
+      { emit: 'event', level: 'query' },
+      { emit: 'event', level: 'error' },
+      { emit: 'event', level: 'warn' },
+    ],
+    errorFormat: 'colorless',
+  });
+
+if (process.env['NODE_ENV'] !== 'production') {
+  globalForPrisma.prisma = prisma;
+}
+
+// Logs de Prisma
+if (process.env['NODE_ENV'] === 'development') {
+  prisma.$on('query', (e) => {
+    if (e.duration > 500) {
+      logger.warn(`[DB] Query lenta (${e.duration}ms): ${e.query}`);
+    }
+  });
+}
+
+prisma.$on('error', (e) => {
+  logger.error('[DB] Error de Prisma:', e);
+});
+
+prisma.$on('warn', (e) => {
+  logger.warn('[DB] Advertencia de Prisma:', e);
+});
+
+// Helper para transacciones
+export async function withTransaction<T>(
+  fn: (tx: Parameters<Parameters<typeof prisma.$transaction>[0]>[0]) => Promise<T>
+): Promise<T> {
+  return prisma.$transaction(fn, {
+    timeout: 10000,
+    maxWait: 5000,
+  });
+}
+
+/**
+ * GUARDIAN BOT - Logger
+ * Sistema de logs con Winston + rotación de archivos
+ */
+
+import winston from 'winston';
+import DailyRotateFile from 'winston-daily-rotate-file';
+import path from 'path';
+
+const { combine, timestamp, colorize, printf, errors, json } = winston.format;
+
+const isDev = process.env['NODE_ENV'] !== 'production';
+
+// Formato para consola (legible)
+const consoleFormat = printf(({ level, message, timestamp: ts, stack, ...meta }) => {
+  let log = `${ts} [${level}]: ${message}`;
+  if (stack) log += `\n${stack}`;
+  if (Object.keys(meta).length > 0) log += `\n${JSON.stringify(meta, null, 2)}`;
+  return log;
+});
+
+// Transports
+const transports: winston.transport[] = [
+  new winston.transports.Console({
+    format: combine(
+      colorize({ all: true }),
+      timestamp({ format: 'HH:mm:ss' }),
+      consoleFormat
+    ),
+    level: isDev ? 'debug' : 'info',
+  }),
+];
+
+// Logs en archivo en producción
+if (process.env['LOG_TO_FILE'] === 'true' || !isDev) {
+  const logsDir = path.join(process.cwd(), 'logs');
+
+  transports.push(
+    new DailyRotateFile({
+      dirname: logsDir,
+      filename: 'guardian-%DATE%.log',
+      datePattern: 'YYYY-MM-DD',
+      maxSize: process.env['LOG_MAX_SIZE'] ?? '10m',
+      maxFiles: process.env['LOG_MAX_FILES'] ?? '7d',
+      level: 'info',
+      format: combine(timestamp(), errors({ stack: true }), json()),
+    }),
+    new DailyRotateFile({
+      dirname: logsDir,
+      filename: 'guardian-error-%DATE%.log',
+      datePattern: 'YYYY-MM-DD',
+      maxSize: process.env['LOG_MAX_SIZE'] ?? '10m',
+      maxFiles: process.env['LOG_MAX_FILES'] ?? '30d',
+      level: 'error',
+      format: combine(timestamp(), errors({ stack: true }), json()),
+    })
+  );
+}
+
+export const logger = winston.createLogger({
+  level: process.env['LOG_LEVEL'] ?? 'info',
+  format: combine(
+    errors({ stack: true }),
+    timestamp({ format: 'YYYY-MM-DD HH:mm:ss' })
+  ),
+  transports,
+  exitOnError: false,
+});
+
+// Helper para logs específicos de módulos
+export function createModuleLogger(module: string) {
+  return {
+    debug: (msg: string, meta?: object) => logger.debug(`[${module}] ${msg}`, meta),
+    info: (msg: string, meta?: object) => logger.info(`[${module}] ${msg}`, meta),
+    warn: (msg: string, meta?: object) => logger.warn(`[${module}] ${msg}`, meta),
+    error: (msg: string, error?: unknown, meta?: object) => {
+      if (error instanceof Error) {
+        logger.error(`[${module}] ${msg}`, { error: error.message, stack: error.stack, ...meta });
+      } else {
+        logger.error(`[${module}] ${msg}`, { error, ...meta });
+      }
+    },
+  };
+}
